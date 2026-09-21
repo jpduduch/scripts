@@ -42,7 +42,8 @@ scripts/
     ├── font-fetcher/         # fetch-fonts reference docs
     └── python/
         ├── .venv/            # shared virtualenv (git-ignored)
-        ├── requirements.txt  # union of both scripts' dependencies
+        ├── requirements.txt  # declared deps (human-edited)
+        ├── requirements.lock # exact versions + hashes (what bootstrap installs)
         ├── convert-url-to-md.py
         ├── x_extract.py      # X/Twitter extractor, imported by the above
         └── fetch-fonts.py
@@ -62,3 +63,20 @@ lib/python/.venv/bin/python -m unittest discover -s lib/autorun/tests -v
 `pandoc` and `imagemagick` come from `brew install pandoc imagemagick`.
 `xorriso` is Linux-only (`sudo dnf install xorriso`) — `bd-burn.sh` and
 `usb-autorun-installer.sh` are not usable on macOS.
+
+## Dependency locking
+
+`bootstrap.sh` installs from `lib/python/requirements.lock` with
+`--require-hashes`, so rebuilding the venv always reproduces the exact set that
+was tested — it can never silently pull a newer, broken library. The venv is
+pinned to Python 3.12.
+
+`requirements.txt` holds the loose, human-edited declarations. To take new
+versions deliberately:
+
+```sh
+cd lib/python
+uv pip compile requirements.txt --generate-hashes \
+    --python-version 3.12 --output-file requirements.lock
+cd ../.. && ./bootstrap.sh          # then re-test before committing
+```

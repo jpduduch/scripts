@@ -23,6 +23,7 @@ export PATH="$HOME/Documents/dev/personal/misc/scripts:$PATH"   # add to ~/.zshr
 | `md-to-epub.sh` | Interactive Markdown to Kindle-friendly EPUB, with JetBrains Mono embedded and Mermaid blocks rendered to images. | `pandoc`, `magick` |
 | `bd-burn.sh <folder> [device] [label]` | Burns a folder to BD-R/DVD/CD. **Linux only.** | `xorriso` |
 | `usb-autorun-installer.sh` | Imports content from a labelled USB volume into a Fedora tvbox. **Linux only, needs `sudo`. Erases the USB volume on success.** | Fedora, GNOME/Wayland |
+| `migrate-fedora-settings.sh` | Exports dnf packages, flatpaks, GNOME extensions and dconf settings from one Fedora box and reinstalls them on another. **Linux only. Must be run from a pendrive** — it refuses to run from disk, and writes its export next to itself. | Fedora, `util-linux` |
 
 Run any of them with `--help` where supported.
 
@@ -36,7 +37,9 @@ scripts/
 ├── md-to-epub.sh             # bash, self-contained
 ├── bd-burn.sh                # bash, self-contained
 ├── usb-autorun-installer.sh  # bash, self-contained
+├── migrate-fedora-settings.sh # bash, self-contained (copy to a pendrive to use)
 └── lib/
+    ├── preflight.sh           # shared dependency check for the wrappers
     ├── fonts/                # JetBrains Mono, embedded by md-to-epub.sh
     ├── autorun/              # usb-autorun docs + test suite
     ├── font-fetcher/         # fetch-fonts reference docs

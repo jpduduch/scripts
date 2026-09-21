@@ -28,8 +28,38 @@ LOG="$PERFIL/errors.txt"
 
 HOUVE_ERRO=0
 
-# criada cedo para que o log tenha onde ser gravado
-mkdir -p "$PERFIL" 2>/dev/null
+# NAO criar $PERFIL aqui: isso rodava antes de verificar_pendrive e sujava
+# qualquer pasta de onde o script fosse chamado (inclusive o repositorio) com
+# um <usuario>-settings vazio. Agora e criada so depois que a verificacao passa.
+
+# ---------- preflight ----------
+
+# Reporta de uma vez tudo que impede o script de rodar, em vez de falhar
+# com uma mensagem obscura mais adiante.
+verificar_ambiente() {
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        printf '\n\033[1;31m  xx  Este script so funciona em Fedora Linux.\033[0m\n' >&2
+        printf '      Sistema atual: %s\n' "$(uname -s)" >&2
+        printf '      Copie o script para um pendrive e rode na maquina Fedora.\n\n' >&2
+        exit 1
+    fi
+
+    local faltando="" ferramenta
+    for ferramenta in findmnt lsblk; do
+        command -v "$ferramenta" >/dev/null 2>&1 || faltando="$faltando $ferramenta"
+    done
+
+    if [[ -n "$faltando" ]]; then
+        printf '\n\033[1;31m  xx  Faltam ferramentas necessarias:\033[0m\n' >&2
+        local n=1
+        for ferramenta in $faltando; do
+            printf '      %s) %s\n' "$n" "$ferramenta" >&2
+            n=$((n + 1))
+        done
+        printf '\n      sudo dnf install util-linux\n\n' >&2
+        exit 1
+    fi
+}
 
 # ---------- helpers ----------
 
@@ -754,7 +784,11 @@ echo
 echo "  Migracao de sistema Fedora"
 echo "  --------------------------"
 
+verificar_ambiente
 verificar_pendrive
+
+# so agora e seguro criar a pasta do perfil (e o log dentro dela)
+mkdir -p "$PERFIL" 2>/dev/null
 
 echo
 echo "  1) Este e o PC de ORIGEM   (exportar o que esta instalado)"

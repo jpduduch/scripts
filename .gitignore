@@ -19,6 +19,12 @@ __pycache__/
 # url-to-md.sh default output folder
 converted/
 
+# migrate-fedora-settings.sh writes its export next to itself, scoped per user
+# (<usuario>-settings/ holding dados-migracao/, migracao.tar.gz, errors.txt).
+# It refuses to run outside a pendrive, so this should never trigger here —
+# kept as a backstop so a personal system dump can never be committed.
+*-settings/
+
 # md-to-epub.sh writes the finished book next to the source Markdown
 *.epub
 

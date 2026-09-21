@@ -1,13 +1,64 @@
-# Python virtualenv — a build artifact, not source.
-# Recreate it with ./bootstrap.sh (venvs hard-code absolute paths and are
-# ~100 MB, so they do not belong in git).
+# ─── Python environment ──────────────────────────────────────────────────────
+# The venv is a build artifact: ~100 MB and it hard-codes absolute paths, so it
+# is not portable. Recreate it with ./bootstrap.sh, which installs the exact
+# pinned set from lib/python/requirements.lock.
 lib/python/.venv/
+.venv/
+venv/
+env/
 
+# Python byte-code and tooling caches
 __pycache__/
 *.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# macOS
-.DS_Store
-
-# Default output folder of url-to-md.sh
+# ─── Script output ───────────────────────────────────────────────────────────
+# url-to-md.sh default output folder
 converted/
+
+# md-to-epub.sh writes the finished book next to the source Markdown
+*.epub
+
+# md-to-epub.sh scratch files (normally removed on exit, left behind on a crash
+# or a Ctrl-C part way through a conversion)
+kindle_style_tmp.css
+kindle_processed_tmp.md
+kindle_final_tmp.md
+kindle_processed.tmp
+kimg_*.png
+kmermaid_*.png
+raw_tmp_*
+mraw_tmp_*
+
+# ─── Secrets ─────────────────────────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+
+# ─── Editors and tooling ─────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code machine-local settings (settings.json stays shareable)
+.claude/settings.local.json
+
+# ─── macOS ───────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+._*
+.Spotlight-V100
+.Trashes
+
+# ─── Explicitly kept ─────────────────────────────────────────────────────────
+# lib/fonts/*.ttf are source, not artifacts: md-to-epub.sh embeds them into
+# every generated EPUB. The rules above deliberately avoid a generic font or
+# "fonts/" pattern so these stay tracked.
+!lib/fonts/
+!lib/fonts/*.ttf

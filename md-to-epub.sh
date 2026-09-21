@@ -11,10 +11,31 @@ else
     DICA_INSTALACAO="sudo dnf install pandoc ImageMagick"
 fi
 
-# 2. Verifica se as ferramentas essenciais estão instaladas
-if ! command -v pandoc &> /dev/null || ! command -v magick &> /dev/null; then
-    echo "❌ ERRO: Pandoc ou ImageMagick nao encontrados."
-    echo "Por favor, instale as dependencias: $DICA_INSTALACAO"
+# 2. Verifica se as ferramentas essenciais estao instaladas.
+#    Reporta TODAS as que faltam de uma vez, com o comando de instalacao certo
+#    para o sistema atual, em vez de parar na primeira.
+FALTANDO=""
+command -v pandoc  >/dev/null 2>&1 || FALTANDO="$FALTANDO pandoc"
+command -v magick  >/dev/null 2>&1 || FALTANDO="$FALTANDO imagemagick"
+
+if [ -n "$FALTANDO" ]; then
+    echo "❌ ERRO: faltam dependencias para gerar o EPUB."
+    echo
+    n=1
+    for ferramenta in $FALTANDO; do
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            COMANDO="brew install $ferramenta"
+        elif [ "$ferramenta" = "imagemagick" ]; then
+            COMANDO="sudo dnf install ImageMagick"
+        else
+            COMANDO="sudo dnf install $ferramenta"
+        fi
+        echo "  $n) '$ferramenta' nao encontrado"
+        echo "     $COMANDO"
+        n=$((n + 1))
+    done
+    echo
+    echo "Ou instale tudo de uma vez: $DICA_INSTALACAO"
     echo "============================================="
     read -p "Pressione [Enter] para fechar..."
     exit 1

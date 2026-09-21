@@ -14,12 +14,11 @@ done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
 PY_DIR="$SCRIPT_DIR/lib/python"
-VENV_PY="$PY_DIR/.venv/bin/python"
 
-if [ ! -x "$VENV_PY" ]; then
-    echo "Erro: virtualenv nao encontrado em $PY_DIR/.venv" >&2
-    echo "Rode uma vez: $SCRIPT_DIR/bootstrap.sh" >&2
-    exit 1
-fi
+# shellcheck source=lib/preflight.sh
+. "$SCRIPT_DIR/lib/preflight.sh"
 
-exec "$VENV_PY" "$PY_DIR/fetch-fonts.py" "$@"
+EXTRA_TOOLS=""
+preflight $EXTRA_TOOLS || exit 1
+
+exec "$PY_DIR/.venv/bin/python" "$PY_DIR/fetch-fonts.py" "$@"

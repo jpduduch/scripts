@@ -18,8 +18,7 @@ VENV_PY="$PY_DIR/.venv/bin/python"
 
 if [ ! -x "$VENV_PY" ]; then
     echo "Erro: virtualenv nao encontrado em $PY_DIR/.venv" >&2
-    echo "Recrie com: uv venv $PY_DIR/.venv --python 3.12 && \\" >&2
-    echo "            uv pip install --python $PY_DIR/.venv/bin/python -r $PY_DIR/requirements.txt" >&2
+    echo "Rode uma vez: $SCRIPT_DIR/bootstrap.sh" >&2
     exit 1
 fi
 

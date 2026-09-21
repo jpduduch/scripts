@@ -39,6 +39,7 @@ scripts/
 └── lib/
     ├── fonts/                # JetBrains Mono, embedded by md-to-epub.sh
     ├── autorun/              # usb-autorun docs + test suite
+    ├── font-fetcher/         # fetch-fonts reference docs
     └── python/
         ├── .venv/            # shared virtualenv (git-ignored)
         ├── requirements.txt  # union of both scripts' dependencies

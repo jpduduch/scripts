@@ -1,0 +1,13 @@
+# Python virtualenv — a build artifact, not source.
+# Recreate it with ./bootstrap.sh (venvs hard-code absolute paths and are
+# ~100 MB, so they do not belong in git).
+lib/python/.venv/
+
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Default output folder of url-to-md.sh
+converted/

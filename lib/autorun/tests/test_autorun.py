@@ -393,6 +393,85 @@ for n in ${cand_parts[@]+"${cand_parts[@]}"}; do printf 'PART %s\\n' "$n"; done
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.names_in(self.dest), ["film.mkv"])
 
+    # --------------------------------------------------------- releasing media
+
+    def release(self, dev, optical, parent="sdb", transport="usb", removable="1",
+                hotplug="1", unmount_ok=True):
+        """Runs release_media with the block-device tools stubbed.
+
+        release_media sends their output to /dev/null, so the stubs record what
+        they were asked to do in a trace file instead.
+        """
+        self.trace_file = self.root / "trace.log"
+        unmount_status = 0 if unmount_ok else 1
+        result = self.run_shell(f'''
+TRACE={shlex.quote(str(self.trace_file))}
+udisksctl() {{
+    printf 'UDISKSCTL %s\\n' "$*" >> "$TRACE"
+    case " $* " in *" unmount "*) return {unmount_status} ;; esac
+    return 0
+}}
+eject() {{ printf 'EJECT %s\\n' "$*" >> "$TRACE"; }}
+lsblk() {{
+    case " $* " in
+        *" PKNAME "*)  printf '%s\\n' {shlex.quote(parent)} ;;
+        *" TRAN "*)    printf '%s\\n' {shlex.quote(transport)} ;;
+        *" RM "*)      printf '%s\\n' {shlex.quote(removable)} ;;
+        *" HOTPLUG "*) printf '%s\\n' {shlex.quote(hotplug)} ;;
+    esac
+}}
+release_media {shlex.quote(dev)} {shlex.quote(optical)}
+''')
+        return result
+
+    def trace(self):
+        return self.trace_file.read_text() if self.trace_file.exists() else ""
+
+    def test_a_disc_is_unmounted_then_ejected_never_powered_off(self):
+        result = self.release("/dev/sr0", "yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("UDISKSCTL unmount --no-user-interaction -b /dev/sr0", self.trace())
+        self.assertIn("EJECT /dev/sr0", self.trace())
+        self.assertNotIn("power-off", self.trace())
+
+    def test_a_usb_drive_is_unmounted_then_the_whole_disk_powered_off(self):
+        result = self.release("/dev/sdb1", "no")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("UDISKSCTL unmount --no-user-interaction -b /dev/sdb1", self.trace())
+        # The partition is unmounted, but it is the disk behind it that powers down.
+        self.assertIn("UDISKSCTL power-off --no-user-interaction -b /dev/sdb", self.trace())
+        self.assertNotIn("EJECT", self.trace())
+        self.assertIn("powered down", result.stderr)
+
+    def test_an_internal_drive_is_unmounted_but_left_powered_on(self):
+        result = self.release("/dev/sda2", "no", parent="sda", transport="sata",
+                              removable="0", hotplug="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("UDISKSCTL unmount --no-user-interaction -b /dev/sda2", self.trace())
+        self.assertNotIn("power-off", self.trace())
+        self.assertIn("not a removable drive", result.stderr)
+
+    def test_a_drive_whose_only_hint_is_hotplug_still_powers_off(self):
+        result = self.release("/dev/sdc1", "no", transport="", removable="0", hotplug="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("power-off", self.trace())
+
+    def test_a_failed_unmount_stops_before_ejecting_or_powering_off(self):
+        for dev, optical in [("/dev/sr0", "yes"), ("/dev/sdb1", "no")]:
+            with self.subTest(dev=dev):
+                result = self.release(dev, optical, unmount_ok=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("EJECT", self.trace())
+                self.assertNotIn("power-off", self.trace())
+                self.assertIn("Could not unmount", result.stderr)
+                self.trace_file.unlink()
+
+    def test_an_unpartitioned_drive_powers_itself_off(self):
+        # lsblk gives no PKNAME for whole-disk media, so the device is the disk.
+        result = self.release("/dev/sdd", "no", parent="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("UDISKSCTL power-off --no-user-interaction -b /dev/sdd", self.trace())
+
     # ------------------------------------------------------------ zip sets
 
     def make_zip(self):

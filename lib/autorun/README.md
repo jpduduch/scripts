@@ -2,8 +2,9 @@
 
 `usb-autorun-installer.sh` installs a background importer for DNF-based Fedora
 Workstation with GNOME. **GNOME mounts drives and discs exactly as it always
-does** — they appear in Files, you eject them from Files. The importer simply
-notices the new mount and copies videos out of it into your `~/Videos`.
+does** — they appear in Files like anything else. The importer notices the new
+mount, copies videos out of it into your `~/Videos`, and then releases the
+media so you can unplug it.
 
 Nothing is played. Kodi is installed so you can open it yourself; this tool
 never starts it, and never starts VLC either.
@@ -23,8 +24,30 @@ on the drive becomes `~/Videos/film.mkv`. **A name already in `~/Videos` is left
 alone** — nothing is ever replaced or deleted. Every copy is verified with an
 rsync checksum pass, and the media is only ever read.
 
-Discs are unmounted and ejected after their import, so the next disc of a set
-can go in. USB drives stay mounted; eject them from Files as usual.
+## Releasing the media
+
+Media the importer took over is released as soon as it is done with it, so you
+can simply unplug it:
+
+| The media is… | What happens when the import finishes |
+|---|---|
+| a disc in the optical drive | unmounted, then the tray opens — which also frees the reader for the next disc of a set |
+| any other drive | unmounted, then **powered down**, so an external hard drive spins down before you pull the cable |
+| one this tool ignored | nothing — it stays mounted, exactly as GNOME left it |
+
+There is no reliable way to tell a flash drive from an external hard drive, so
+both are treated as a hard drive and powered down. Power-off targets the whole
+disk, not the partition that was imported from, and only ever a drive UDisks
+reports as USB-attached, removable, or hotpluggable — an internal disk mounted
+under `/run/media` is unmounted but left powered on.
+
+Releasing is best-effort and never fails an import that already succeeded. If
+the unmount is refused — a file still open on the drive, say — nothing further
+is attempted and the log says so. A drive with a **second partition still
+mounted** unmounts cleanly but cannot power down, because UDisks refuses an
+unsafe power-off; the log names the drive so you can check it before
+unplugging. Media whose import was refused or failed is deliberately left
+mounted so you can look at it.
 
 ## `watch.txt`
 
@@ -213,11 +236,13 @@ python3 -m unittest discover -s tests -v
 ```
 
 The tests use temporary directories for real copies, deletions and extractions;
-only the desktop notification bus is substituted. They cover flat copying with
-skip-on-existing, whole-folder copying, checksum mismatches, partial-copy
-cleanup, media preservation, symlink escapes, `watch.txt` parsing and refusals,
-span/split part detection including ROM lookalikes, multi-disc collection, and
-extraction. Disc tests use directories as discs with real zip, split and span
+only the desktop notification bus and the block-device tools are substituted.
+They cover flat copying with skip-on-existing, whole-folder copying, checksum
+mismatches, partial-copy cleanup, media preservation, symlink escapes,
+`watch.txt` parsing and refusals, span/split part detection including ROM
+lookalikes, multi-disc collection, extraction, and releasing media — eject for
+a disc, power-off of the whole disk for a drive, neither for an internal one
+or after a refused unmount. Disc tests use directories as discs with real zip, split and span
 archives, and real `7z` extraction when installed. GNU `find -regextype` is
 required, so media-scanning tests are skipped off Linux. Full systemd-path,
 UDisks and GNOME integration must be validated on Fedora with a disposable USB

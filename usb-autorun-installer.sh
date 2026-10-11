@@ -10,6 +10,8 @@
 # Multi-part zip sets found the same way collect in ~/Videos/temp and, once
 # every part has arrived, are extracted into ~/Videos; temp is then removed.
 # Copies never replace anything: a name already in ~/Videos is left alone.
+# Media it imported from is then released so it can just be unplugged: a disc
+# is ejected, any other drive is unmounted and powered down.
 # Media is only ever read. Nothing is played; Kodi is installed, never started.
 set -euo pipefail
 
@@ -597,13 +599,51 @@ import_mount() (
     fi
 )
 
-# Unmounts and ejects a disc so the next one of a set can go in. USB drives are
-# GNOME's to eject, and are left mounted.
-release_disc() {
-    local dev=$1
-    udisksctl unmount --no-user-interaction -b "$dev" >/dev/null 2>&1 ||
-        log "Could not unmount $dev; eject it from Files."
-    eject "$dev" 2>/dev/null || log "Could not eject $dev."
+# The whole-disk device behind a partition: /dev/sdb for /dev/sdb1.
+parent_disk() {
+    local parent
+    parent=$(lsblk -dnro PKNAME -- "$1" 2>/dev/null) || parent=''
+    [[ -n $parent ]] || { printf '%s\n' "$1"; return 0; }
+    printf '/dev/%s\n' "$parent"
+}
+
+# True for a drive that may be powered down -- a USB stick or an external disk,
+# never an internal one. lsblk drops empty fields in raw output, which would
+# shift a positional read, so each column is asked for on its own.
+removable_drive() {
+    local transport removable hotplug
+    transport=$(lsblk -dnro TRAN -- "$1" 2>/dev/null) || transport=''
+    removable=$(lsblk -dnro RM -- "$1" 2>/dev/null) || removable=''
+    hotplug=$(lsblk -dnro HOTPLUG -- "$1" 2>/dev/null) || hotplug=''
+    [[ $transport == usb || $removable == 1 || $hotplug == 1 ]]
+}
+
+# Lets go of media this tool has finished with, so it can simply be unplugged.
+# A disc is ejected, which also frees the reader for the next disc of a set.
+# Anything else is unmounted and then powered down: there is no reliable way to
+# tell a flash drive from an external hard drive, so both are treated as a hard
+# drive and spun down before removal. Media this tool ignored is never touched.
+release_media() {
+    local dev=$1 optical=$2 parent
+    if ! udisksctl unmount --no-user-interaction -b "$dev" >/dev/null 2>&1; then
+        log "Could not unmount $dev; release it from Files before unplugging."
+        return 0
+    fi
+    if [[ $optical == yes ]]; then
+        eject "$dev" 2>/dev/null || log "$dev is unmounted, but the tray would not open."
+        return 0
+    fi
+    parent=$(parent_disk "$dev")
+    if ! removable_drive "$parent"; then
+        log "$dev is unmounted; $parent is not a removable drive, so it stays powered on."
+        return 0
+    fi
+    # UDisks refuses an unsafe power-off, e.g. with another partition mounted.
+    if udisksctl power-off --no-user-interaction -b "$parent" >/dev/null 2>&1; then
+        log "$parent is powered down; safe to unplug."
+    else
+        log "$dev is unmounted, but powering $parent down failed. Check its other partitions before unplugging."
+    fi
 }
 
 # Drops the mounts this scan already dealt with that are gone, so the same media
@@ -661,9 +701,9 @@ scan_media() {
         status=0
         import_mount "$dir" "$label" "$optical" || status=$?
         case $status in
-            # Only media this tool actually took over is ejected, so the next
-            # disc of a set can go in. Everything else stays mounted for GNOME.
-            0) [[ $optical != yes ]] || release_disc "$dev" ;;
+            # Only media this tool actually took over is released; a drive
+            # it ignored stays mounted and powered, as GNOME left it.
+            0) release_media "$dev" "$optical" ;;
             "$IGNORED") ;;
             # A refusal has already explained itself in a notification.
             "$REFUSED") log "$dir was refused." ;;
@@ -811,8 +851,12 @@ GNOME keeps mounting drives and discs normally. Once mounted:
   otherwise                    nothing is copied
 Videos land directly in the destination; a name already there is left alone.
 Multi-part zip sets collect in DEST/temp, are extracted into DEST once every
-part has arrived, and temp is then removed. Discs are ejected after import so
-the next one of a set can go in. Media is only ever read.
+part has arrived, and temp is then removed. Media is only ever read.
+
+After importing, the media is released so it can be unplugged as it is: a disc
+is ejected, freeing the reader for the next disc of a set; any other drive is
+unmounted and then powered down, flash drives and external hard drives alike.
+A drive this tool ignored is left mounted, exactly as GNOME had it.
 
 Kodi is installed for you to open yourself; this tool never launches it.
 --reset discards the zip parts collected so far.

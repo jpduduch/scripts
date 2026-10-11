@@ -44,13 +44,52 @@ require_root() { [[ $EUID -eq 0 ]] || die "Run with sudo."; }
 validate_user() {
     USER_ID=$(id -u "$USER_NAME") || die "User '$USER_NAME' does not exist."
     [[ $USER_ID -ne 0 ]] || die "Choose a desktop user, not root (--user NAME)."
+    # runuser keeps the caller's HOME, so installing from another account would
+    # otherwise resolve ~ against the installer's home, not the target user's.
+    USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
+    [[ -n $USER_HOME && -d $USER_HOME ]] ||
+        die "User '$USER_NAME' has no home directory to copy into."
+}
+
+# Runs COMMAND as the desktop user with their own home and nothing of ours.
+as_user() {
+    runuser -u "$USER_NAME" -- env HOME="$USER_HOME" "$@"
 }
 
 user_systemctl() {
-    runuser -u "$USER_NAME" -- env \
+    as_user \
         XDG_RUNTIME_DIR="/run/user/$USER_ID" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_ID/bus" \
         systemctl --user "$@"
+}
+
+# Arms the watcher in the desktop user's session. Installing from a different
+# account is fine: with that user logged out their systemd manager is not
+# running, so make the same symlink `systemctl --user enable` would have made
+# and let their next login pick it up.
+enable_for_user() {
+    local wants="$USER_HOME/.config/systemd/user/default.target.wants"
+    if [[ -S /run/user/$USER_ID/bus ]]; then
+        user_systemctl stop usb-autorun-player.service 2>/dev/null || true
+        user_systemctl daemon-reload
+        user_systemctl enable --now usb-autorun.path ||
+            die "Cannot enable the watcher in $USER_NAME's session."
+        log "The watcher is armed in $USER_NAME's running session."
+        return
+    fi
+    as_user mkdir -p -- "$wants" || die "Cannot create $wants."
+    as_user ln -sfn "$PATH_UNIT" "$wants/usb-autorun.path" ||
+        die "Cannot enable the watcher for $USER_NAME."
+    log "$USER_NAME is not logged in; the watcher is enabled and starts at their next login."
+}
+
+disable_for_user() {
+    if [[ -n ${USER_ID:-} && -S /run/user/$USER_ID/bus ]]; then
+        user_systemctl disable --now usb-autorun.path 2>/dev/null || true
+        return
+    fi
+    [[ -z ${USER_HOME:-} ]] ||
+        rm -f "$USER_HOME/.config/systemd/user/default.target.wants/usb-autorun.path"
 }
 
 # Critical urgency keeps the notification on screen until it is dismissed.
@@ -68,21 +107,31 @@ refuse() {
 
 # ---------------------------------------------------------------- destination
 
+# Folds away "." and ".." so a traversal cannot dress a path outside the home up
+# as one inside it. Symlinks are deliberately left alone (-s): pointing
+# ~/Videos at another disk is a normal thing to do.
+normalise_path() { realpath -m -s -- "$1"; }
+
 resolve_dest() {
     if [[ -z $DEST ]]; then
         DEST=$(xdg-user-dir VIDEOS 2>/dev/null) || DEST=""
         [[ -n $DEST && $DEST != "$HOME" ]] || DEST="$HOME/Videos"
     fi
+    DEST=$(normalise_path "$DEST") || die "Cannot resolve the destination: $DEST"
     TEMP_DIR="$DEST/temp"
 }
 
 # The importer runs as the desktop user and only ever adds files, so the
 # destination just has to be a real directory of theirs, never the media itself.
 validate_destination() {
+    local home
     [[ $DEST == /* ]] || die "Destination must be an absolute path: $DEST"
+    DEST=$(normalise_path "$DEST") || die "Cannot resolve the destination: $DEST"
+    home=$(normalise_path "$HOME") || die "Cannot resolve the home directory: $HOME"
+    TEMP_DIR="$DEST/temp"
     [[ $DEST != /run/media/* ]] || die "Destination must not be on removable media: $DEST"
-    [[ $DEST != "$HOME" ]] || die "Destination must be a folder inside $HOME, not $HOME itself."
-    [[ $DEST == "$HOME"/* ]] || die "Destination must live inside $HOME: $DEST"
+    [[ $DEST != "$home" ]] || die "Destination must be a folder inside $home, not $home itself."
+    [[ $DEST == "$home"/* ]] || die "Destination must live inside $home: $DEST"
     mkdir -p -- "$DEST" || die "Cannot create the destination: $DEST"
     [[ -d $DEST ]] || die "Destination is not a directory: $DEST"
 }
@@ -128,10 +177,14 @@ copy_item() {
 
 # Prints the zip set (NAME.zip) a part belongs to: 7-Zip/split volumes are
 # NAME.zip.001, NAME.zip.002, ...; Info-ZIP spans are NAME.z01, ..., NAME.zip.
+# An ISO9660 disc may record the names in upper case, so match without regard
+# to case and answer in lower case: one set then has exactly one name, whatever
+# the medium each part arrived on spelled it like.
 part_set() {
-    if [[ $1 =~ ^(.+\.zip)\.[0-9]{3,}$ ]]; then
+    local lower=${1,,}
+    if [[ $lower =~ ^(.+\.zip)\.[0-9]{3,}$ ]]; then
         printf '%s\n' "${BASH_REMATCH[1]}"
-    elif [[ $1 =~ ^(.+)\.z[0-9]{2,}$ ]]; then
+    elif [[ $lower =~ ^(.+)\.z[0-9]{2,}$ ]]; then
         printf '%s.zip\n' "${BASH_REMATCH[1]}"
     else
         return 1
@@ -185,18 +238,22 @@ zip_disk_count() {
 # Prints "complete VOLUME" (the file to extract) when every part of SET is in
 # DIR, otherwise "missing PART" naming the first part still needed.
 zip_set_status() {
-    local dir=$1 set=$2 stem=${2%.zip} file name final='' n disks
+    local dir=$1 set=$2 stem=${2%.zip} file name suffix final='' n disks
     local -A split=() span=()
     local -a volumes=()
-    for file in "$dir/$stem".*; do
+    # SET is lower case by construction (see part_set); the files on disc need
+    # not be, so compare folded and split the suffix off by length.
+    for file in "$dir"/*; do
         [[ -f $file ]] || continue
         name=${file##*/}
-        name=${name#"$stem".}
-        if [[ $name =~ ^zip\.([0-9]{3,})$ ]]; then
+        [[ ${name,,} == "$stem".* ]] || continue
+        suffix=${name:${#stem}+1}
+        suffix=${suffix,,}
+        if [[ $suffix =~ ^zip\.([0-9]{3,})$ ]]; then
             split[$((10#${BASH_REMATCH[1]}))]=$file
-        elif [[ $name =~ ^z([0-9]{2,})$ ]]; then
+        elif [[ $suffix =~ ^z([0-9]{2,})$ ]]; then
             span[$((10#${BASH_REMATCH[1]}))]=$file
-        elif [[ $name == zip ]]; then
+        elif [[ $suffix == zip ]]; then
             final=$file
         fi
     done
@@ -246,44 +303,120 @@ temp_has_set() {
     return 1
 }
 
+# Prints the already-collected final volume (NAME.zip) of SET, if it has
+# arrived on an earlier disc.
+collected_final_zip() {
+    local set=$1 file name
+    [[ -d $TEMP_DIR ]] || return 1
+    for file in "$TEMP_DIR"/*; do
+        [[ -f $file ]] || continue
+        name=${file##*/}
+        [[ ${name,,} == "$set" ]] || continue
+        printf '%s\n' "$file"
+        return 0
+    done
+    return 1
+}
+
+# Prints how many volumes SET spans, reading the record at the end of its final
+# NAME.zip wherever that has got to. Fails while that volume is still missing,
+# which is simply when the span's length is not knowable yet.
+set_volume_count() {
+    local set=$1 final=${zips[$1]:-}
+    [[ -n $final ]] || final=$(collected_final_zip "$set") || return 1
+    zip_disk_count "$final"
+}
+
+# Records in `collected` which volumes of which set earlier discs have already
+# contributed, so a part arriving on this one can be checked against them.
+note_collected_volumes() {
+    local file name set
+    [[ -d $TEMP_DIR ]] || return 0
+    for file in "$TEMP_DIR"/*; do
+        [[ -f $file ]] || continue
+        name=${file##*/}
+        set=$(part_set "$name") || continue
+        [[ ${name,,} =~ \.z([0-9]+)$ ]] || continue
+        collected[$set/$((10#${BASH_REMATCH[1]}))]=1
+    done
+}
+
 # Turns the candidate names in cand_parts/cand_zips into the real part files,
 # in parts. Split volumes (NAME.zip.001) are unambiguous. NAME.zNN is also used
 # by other files, such as N64 ROMs (.z64), so a span counts only once its set is
 # proven: NAME.z01 opens with the zip spanning signature, a NAME.zip beside it
-# spans several volumes, or the set is already collecting in $TEMP_DIR.
+# spans several volumes, or the set is already collecting in $TEMP_DIR. Each
+# volume then has to fit the span as well (see below), because a proven set
+# sitting beside a ROM of the same name would otherwise swallow it.
 classify_parts() {
-    local path name set disks
-    local -A span_sets=() spans=() zips=() proven=()
+    local path name set index disks n
+    local -A span_sets=() by_index=() indexes=() zips=() proven=() volumes=() \
+        collected=() admitted=()
+    local -a order=()
     parts=()
+    # Keyed by the folded name, so they line up with part_set's lower-case sets.
     for path in "${cand_zips[@]}"; do
-        zips[${path##*/}]=$path
+        name=${path##*/}
+        zips[${name,,}]=$path
     done
     for path in "${cand_parts[@]}"; do
         name=${path##*/}
         set=$(part_set "$name")
-        if [[ $name =~ \.z[0-9]+$ ]]; then
-            spans[$path]=$set
+        if [[ ${name,,} =~ \.z([0-9]+)$ ]]; then
+            index=$((10#${BASH_REMATCH[1]}))
             span_sets[$set]=1
+            by_index[$set/$index]=$path
+            indexes[$set]+=" $index"
         else
             parts+=("$path")
         fi
     done
+    note_collected_volumes
     for set in "${!span_sets[@]}" "${!zips[@]}"; do
-        if temp_has_set "$set"; then
-            proven[$set]=1
-        elif [[ -n ${zips[$set]:-} ]] && disks=$(zip_disk_count "${zips[$set]}") &&
-            (( disks > 1 )); then
-            proven[$set]=1
+        if disks=$(set_volume_count "$set"); then
+            volumes[$set]=$disks
+            if (( disks > 1 )); then proven[$set]=1; fi
         fi
+        if temp_has_set "$set"; then proven[$set]=1; fi
     done
-    for path in "${!spans[@]}"; do
-        [[ ${path##*/} == "${spans[$path]%.zip}.z01" ]] || continue
+    for set in "${!span_sets[@]}"; do
+        path=${by_index[$set/1]:-}
+        [[ -n $path ]] || continue
         [[ $(head -c 4 -- "$path" | od -An -tx1 | tr -d ' \n') != 504b0708 ]] ||
-            proven[${spans[$path]}]=1
+            proven[$set]=1
     done
-    for path in "${!spans[@]}"; do
-        [[ -n ${proven[${spans[$path]}]:-} ]] || continue
-        parts+=("$path")
+    # Even a proven set only takes volumes that actually fit the span, so a
+    # Nintendo 64 ROM sitting beside one of the same name is not swallowed.
+    # Volumes are considered in ascending order, which is what makes the
+    # no-gaps test below transitive.
+    for set in "${!span_sets[@]}"; do
+        [[ -n ${proven[$set]:-} ]] || continue
+        mapfile -t order < <(printf '%s\n' ${indexes[$set]} | sort -n -u)
+        for n in "${order[@]}"; do
+            path=${by_index[$set/$n]}
+            if [[ -n ${volumes[$set]:-} ]]; then
+                # The final NAME.zip is here, so the length is known exactly:
+                # volumes .z01 ... .z(D-1), then the .zip itself as volume D.
+                # Being in range is proof enough, and lets discs arrive in any
+                # order. game.z64 beside a 3-volume span is not in range.
+                if (( n >= volumes[$set] )); then
+                    log "Not part of $set, which spans ${volumes[$set]} volumes: ${path##*/}"
+                    continue
+                fi
+            elif (( n > 1 )) &&
+                [[ -z ${collected[$set/$((n - 1))]:-}${admitted[$set/$((n - 1))]:-} ]]; then
+                # Length unknown, so fall back on the one thing a span always
+                # guarantees: it numbers volumes upwards from .z01 with no
+                # gaps. Volume N needs N-1 collected from an earlier disc or
+                # admitted just now -- a real .z64 part needs a .z63 to go with
+                # it, and a lone game.z64 has none.
+                printf -v name '%s.z%02d' "${set%.zip}" $((n - 1))
+                log "Not part of $set, no $name to go with it: ${path##*/}"
+                continue
+            fi
+            admitted[$set/$n]=1
+            parts+=("$path")
+        done
     done
     # A span ends in NAME.zip, which may sit alone on the set's last disc.
     for name in "${!zips[@]}"; do
@@ -310,8 +443,9 @@ extract_set() {
         rm -rf -- "$stage"
         die "$set holds something that is not a file or folder; its parts are kept in $TEMP_DIR."
     fi
-    for entry in "$stage"/*; do
-        [[ -e $entry ]] || continue
+    # find, not a glob: an archive may hold dotfiles (subtitles, .nfo), and a
+    # plain * would leave them behind to be deleted with the staging folder.
+    while IFS= read -r -d '' entry; do
         name=${entry##*/}
         if [[ -e $DEST/$name ]]; then
             log "Already in $DEST, not extracted: $name"
@@ -319,7 +453,7 @@ extract_set() {
         fi
         mv -- "$entry" "$DEST/$name" || die "Cannot move $name out of the staging folder."
         log "Extracted to $DEST: $name"
-    done
+    done < <(find "$stage" -mindepth 1 -maxdepth 1 -print0)
     rm -rf -- "$stage"
     for file in "$TEMP_DIR"/*; do
         [[ -f $file ]] || continue
@@ -388,7 +522,7 @@ watch_selection() {
             if part_set "$name" >/dev/null; then
                 cand_parts+=("$real")
             else
-                [[ $name != *.zip ]] || cand_zips+=("$real")
+                [[ ${name,,} != *.zip ]] || cand_zips+=("$real")
                 sel_src+=("$real")
                 sel_name+=("$name")
             fi
@@ -424,7 +558,7 @@ whole_media_selection() {
 # IGNORED when the media is none of this tool's business.
 import_mount() (
     set -euo pipefail
-    source=$1 label=$2 optical=$3 copied=0 i=0 path=''
+    source=$1 label=$2 optical=$3 copied=0 videos=0 i=0 path=''
     local -a sel_src=() sel_name=() cand_parts=() cand_zips=() parts=()
     if [[ -f $source/watch.txt ]]; then
         log "$source: using watch.txt."
@@ -446,17 +580,20 @@ import_mount() (
         [[ -z ${is_part[${sel_src[$i]}]:-} ]] || continue
         copy_item "${sel_src[$i]}" "${sel_name[$i]}" "$DEST"
     done
+    videos=$copied
     if [[ ${#parts[@]} -gt 0 ]]; then
         mkdir -p -- "$TEMP_DIR" || die "Cannot create $TEMP_DIR."
         for path in "${parts[@]}"; do
             copy_item "$path" "${path##*/}" "$TEMP_DIR"
         done
+        # finish_sets speaks for the parts: they are not in $DEST yet, so they
+        # must not be announced as copied videos.
         finish_sets
     fi
-    if [[ $copied -eq 0 ]]; then
+    if [[ $videos -gt 0 ]]; then
+        notify_user "Videos copied" "$videos item(s) from ${source##*/} are in $DEST."
+    elif [[ $copied -eq 0 ]]; then
         log "$source: nothing new to copy."
-    else
-        notify_user "Videos copied" "$copied item(s) from ${source##*/} are in $DEST."
     fi
 )
 
@@ -539,6 +676,9 @@ scan_media() {
 
 reset_temp() {
     resolve_dest
+    # This deletes a tree, so re-run the destination checks rather than trusting
+    # whatever /etc/usb-autorun.conf happens to say.
+    validate_destination
     mkdir -p -- "$STATE_DIR"
     exec 9>"$STATE_DIR/lock"
     flock -w 300 9 || die "An import is running. Retry after it finishes."
@@ -567,16 +707,23 @@ install_autorun() {
     dnf install -y --allowerasing kodi ffmpeg-libs \
         udisks2 rsync util-linux coreutils findutils grep systemd \
         xdg-user-dirs 7zip libnotify
-    for bin in rsync flock findmnt mountpoint lsblk runuser udisksctl \
+    for bin in rsync flock findmnt mountpoint lsblk runuser udisksctl realpath \
         7z notify-send eject xdg-user-dir; do
         command -v "$bin" >/dev/null || die "Required command missing after installation: $bin"
     done
+    # --dest is written by whoever runs the installer, who may be another user;
+    # it has to name a folder in the desktop user's home, not in theirs.
+    if [[ -n $DEST ]]; then
+        [[ $DEST == /* ]] || die "--dest must be an absolute path: $DEST"
+        DEST=$(normalise_path "$DEST") || die "Cannot resolve --dest: $DEST"
+        [[ $DEST == "$USER_HOME"/* ]] ||
+            die "--dest must be a folder inside $USER_NAME's home ($USER_HOME)."
+    fi
     local user_dest
-    user_dest=$(runuser -u "$USER_NAME" -- bash -c \
+    user_dest=$(as_user bash -c \
         'd=$(xdg-user-dir VIDEOS 2>/dev/null) || d=""; [[ -n $d && $d != "$HOME" ]] || d="$HOME/Videos"; printf %s "$d"')
     [[ -z $DEST ]] || user_dest=$DEST
-    runuser -u "$USER_NAME" -- mkdir -p -- "$user_dest" ||
-        die "Cannot create the destination: $user_dest"
+    as_user mkdir -p -- "$user_dest" || die "Cannot create the destination: $user_dest"
     install -d -m 0755 /usr/local/libexec /etc/systemd/user
     install -o root -g root -m 0755 "${BASH_SOURCE[0]}" "$SCRIPT_FILE"
     # %q produces shell-safe values; only root may edit this configuration.
@@ -618,15 +765,7 @@ UNIT
     systemctl daemon-reload
     udevadm control --reload-rules
     systemctl start udisks2.service
-    if [[ -S /run/user/$USER_ID/bus ]]; then
-        user_systemctl stop usb-autorun-player.service 2>/dev/null || true
-        user_systemctl daemon-reload
-        user_systemctl enable --now usb-autorun.path ||
-            die "Cannot enable the watcher in $USER_NAME's session."
-    else
-        log "$USER_NAME is not logged in; enable the watcher after logging in with:"
-        log "  systemctl --user enable --now usb-autorun.path"
-    fi
+    enable_for_user
     log "Installed for $USER_NAME. GNOME mounts drives and discs as usual."
     log "Videos go to ${user_dest}; zip parts collect in ${user_dest}/temp."
     log "A disc, or a drive labelled '$FS_LABEL', has every video copied; a drive"
@@ -638,9 +777,10 @@ uninstall_autorun() {
     require_root
     # Read the installed account rather than assuming the current sudo caller.
     if [[ -f $CONFIG_FILE ]]; then source "$CONFIG_FILE"; fi
-    if USER_ID=$(id -u "$USER_NAME" 2>/dev/null) && [[ -S /run/user/$USER_ID/bus ]]; then
-        user_systemctl disable --now usb-autorun.path 2>/dev/null || true
-    fi
+    # The account may be gone, so removal must survive an unknown user.
+    USER_ID=$(id -u "$USER_NAME" 2>/dev/null) || USER_ID=''
+    USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6) || USER_HOME=''
+    disable_for_user
     rm -f "$PATH_UNIT" "$SERVICE_UNIT" "$SCRIPT_FILE" "$CONFIG_FILE" "${LEGACY_FILES[@]}"
     rm -rf --one-file-system -- "${LEGACY_DIRS[@]}"
     systemctl stop 'usb-autorun@*.service' 2>/dev/null || true
@@ -652,14 +792,16 @@ uninstall_autorun() {
 
 usage() {
     cat <<HELP
-Usage: sudo bash $0 [--user NAME] [--label TEMP] [--dest ~/Videos]
+Usage: sudo bash $0 [--user NAME] [--label TEMP] [--dest /home/NAME/Videos]
        sudo bash $0 --delete
        $SCRIPT_FILE --reset
        $SCRIPT_FILE --scan
 
 Installs the packages and the two user units that copy videos off USB drives
 and discs on Fedora Workstation with GNOME. Default user: sudo's calling user
-(fallback: joao). Default destination: the user's XDG Videos folder.
+(fallback: joao). Default destination: that user's XDG Videos folder.
+Any account may install this for any other; --user does not have to be logged
+in, and --dest must then be spelled out, inside that user's home.
 
 GNOME keeps mounting drives and discs normally. Once mounted:
   watch.txt at the drive root  copies the paths it lists; a listed folder is

@@ -227,6 +227,66 @@ for n in ${parts[@]+"${parts[@]}"}; do printf 'PART %s\\n' "$n"; done
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual([Path(p).name for p in self.tagged(result, "PART")], expected)
 
+    @linux_only
+    @unittest.skipUnless(shutil.which("zip"), "Info-ZIP zip is required")
+    def test_a_rom_is_not_swallowed_by_a_real_span_of_the_same_name(self):
+        # set.z01/set.z02/set.zip is a genuine 3-volume span; set.z64 beside it
+        # is a Nintendo 64 ROM, and volume 64 cannot exist in a 3-volume span.
+        staging = self.make_span_parts()
+        for part in staging.iterdir():
+            shutil.copy(part, self.source)
+            self.age(self.source / part.name)
+        self.video("set.z64", b"\x80\x37\x12\x40 rom")
+        result = self.select()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([Path(p).name for p in self.tagged(result, "PART")],
+                         ["set.z01", "set.z02", "set.zip"])
+        self.assertIn("which spans 3 volumes: set.z64", result.stderr)
+
+    @linux_only
+    def test_a_lone_z64_needs_a_z63_even_when_its_set_is_collecting(self):
+        # Without the final .zip the span's length is unknown, so the only
+        # guarantee left is that volumes run upwards from .z01 with no gaps.
+        (self.dest / "temp").mkdir(parents=True)
+        (self.dest / "temp" / "zelda.z01").write_bytes(os.urandom(500))
+        self.video("Zelda.z64", b"\x80\x37\x12\x40 rom")
+        result = self.select()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.tagged(result, "PART"), [])
+        self.assertIn("no zelda.z63 to go with it", result.stderr)
+
+    @linux_only
+    def test_a_z64_is_taken_once_the_whole_chain_below_it_is_there(self):
+        (self.dest / "temp").mkdir(parents=True)
+        for n in range(1, 63):
+            (self.dest / "temp" / f"big.z{n:02d}").write_bytes(os.urandom(64))
+        for name in ["big.z63", "big.z64"]:
+            self.video(name, os.urandom(64))
+        result = self.select()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([Path(p).name for p in self.tagged(result, "PART")],
+                         ["big.z63", "big.z64"])
+
+    @linux_only
+    def test_a_gap_below_a_volume_rejects_it_and_everything_above_it(self):
+        (self.dest / "temp").mkdir(parents=True)
+        (self.dest / "temp" / "big.z01").write_bytes(os.urandom(64))
+        for name in ["big.z63", "big.z64"]:   # z02..z62 are missing
+            self.video(name, os.urandom(64))
+        result = self.select()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.tagged(result, "PART"), [],
+                         "z64 must not ride in on a z63 that was itself refused")
+
+    @linux_only
+    def test_an_absurd_volume_number_does_not_hang_the_scan(self):
+        (self.dest / "temp").mkdir(parents=True)
+        (self.dest / "temp" / "thing.z01").write_bytes(os.urandom(64))
+        self.video("thing.z99999999", b"rom")
+        result = self.select()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.tagged(result, "PART"), [])
+
     # --------------------------------------------------------------- watch.txt
 
     def write_watch(self, text):
@@ -460,10 +520,65 @@ done
         self.assertEqual(self.names_in(self.dest / "temp"), ["other.zip.001"])
         self.assertTrue((self.dest / "movie.mkv").exists())
 
+    @linux_only
+    @unittest.skipUnless(shutil.which("7z"), "7-Zip is required")
+    def test_dotfiles_inside_an_archive_are_extracted_too(self):
+        # A plain */ glob over the staging folder would drop these silently.
+        self.movie = os.urandom(200_000)
+        whole = self.root / "whole.zip"
+        with zipfile.ZipFile(whole, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr("movie.mkv", self.movie)
+            archive.writestr(".subtitles.srt", "hidden but wanted")
+        data = whole.read_bytes()
+        for number, start in enumerate(range(0, len(data), 100_000), 1):
+            part = self.source / f"set.zip.{number:03d}"
+            part.write_bytes(data[start:start + 100_000])
+            self.age(part)
+        result = self.run_shell('import_mount "$MP" temp no')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.dest / ".subtitles.srt").read_text(), "hidden but wanted")
+        self.assertEqual((self.dest / "movie.mkv").read_bytes(), self.movie)
+
+    @linux_only
+    @unittest.skipUnless(shutil.which("7z"), "7-Zip is required")
+    def test_a_disc_recorded_in_upper_case_is_still_one_set(self):
+        staging = self.root / "all-parts"
+        self.make_split_parts(staging)
+        discs = []
+        for number, part in enumerate(sorted(staging.iterdir()), 1):
+            disc = self.root / f"disc{number}"
+            disc.mkdir()
+            shutil.copy(part, disc / part.name.upper())
+            self.age(disc / part.name.upper())
+            discs.append(disc)
+        for disc in discs[:-1]:
+            result = self.run_shell(f'import_mount {shlex.quote(str(disc))} "" yes')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("NOTIFY Insert the next disc", result.stderr)
+        last = self.run_shell(f'import_mount {shlex.quote(str(discs[-1]))} "" yes')
+        self.assertEqual(last.returncode, 0, last.stderr)
+        self.assertEqual((self.dest / "movie.mkv").read_bytes(), self.movie)
+        self.assertFalse((self.dest / "temp").exists())
+
+    def test_destination_cannot_be_escaped_with_dot_dot(self):
+        result = self.run_shell('DEST="$HOME/Videos/../../etc/cron.d"; validate_destination')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must live inside", result.stderr)
+        self.assertNotIn("Videos/..", result.stderr, "the path is reported folded")
+
+    @linux_only
+    def test_collected_parts_are_not_announced_as_copied_videos(self):
+        (self.source / "set.zip.001").write_bytes(os.urandom(50_000))
+        self.age(self.source / "set.zip.001")
+        result = self.run_shell('import_mount "$MP" temp no')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("NOTIFY Insert the next disc", result.stderr)
+        self.assertNotIn("NOTIFY Videos copied", result.stderr)
+
     def test_reset_discards_the_collected_parts(self):
         (self.dest / "temp").mkdir()
         (self.dest / "temp" / "set.zip.001").write_text("part")
-        result = self.run_shell('resolve_dest() { :; }; reset_temp')
+        result = self.run_shell("resolve_dest() { :; }; validate_destination() { :; }; reset_temp")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.dest / "temp").exists())
         self.assertEqual(self.names_in(self.dest), [])

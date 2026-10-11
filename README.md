@@ -22,7 +22,7 @@ export PATH="$HOME/Documents/dev/personal/misc/scripts:$PATH"   # add to ~/.zshr
 | `fetch-fonts.sh <url>` | Downloads the `@font-face` fonts a page uses, one folder per family. `--convert` decompresses woff/woff2 to `.otf`/`.ttf`. | venv |
 | `md-to-epub.sh` | Interactive Markdown to Kindle-friendly EPUB, with JetBrains Mono embedded and Mermaid blocks rendered to images. | `pandoc`, `magick` |
 | `bd-burn.sh <folder> [device] [label]` | Burns a folder to BD-R/DVD/CD. **Linux only.** | `xorriso` |
-| `usb-autorun-installer.sh` | Imports content from a labelled USB volume into a Fedora tvbox. **Linux only, needs `sudo`. Erases the USB volume on success.** | Fedora, GNOME/Wayland |
+| `usb-autorun-installer.sh` | Opens any USB drive or disc in Kodi on a Fedora tvbox, first copying it to `/home/public` when it has a `watch.txt`, the label `TEMP`, or multi-disc zip parts; closing Kodi powers the drive off or ejects the disc. **Linux only, needs `sudo`. Copies replace `/home/public`.** | Fedora, GNOME/Wayland |
 | `migrate-fedora-settings.sh` | Exports dnf packages, flatpaks, GNOME extensions and dconf settings from one Fedora box and reinstalls them on another. **Linux only. Must be run from a pendrive** — it refuses to run from disk, and writes its export next to itself. | Fedora, `util-linux` |
 
 Run any of them with `--help` where supported.

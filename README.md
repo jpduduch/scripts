@@ -10,8 +10,8 @@ once this folder is on your `PATH`.
 ## Setup
 
 ```sh
-./bootstrap.sh                                   # creates the shared Python venv
 export PATH="$HOME/path/to/folder/scripts:$PATH"   # add to ~/.zshrc
+./bootstrap.sh                                     # creates the shared Python venv
 ```
 
 ## Commands

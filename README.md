@@ -11,7 +11,7 @@ once this folder is on your `PATH`.
 
 ```sh
 ./bootstrap.sh                                   # creates the shared Python venv
-export PATH="$HOME/Documents/dev/personal/misc/scripts:$PATH"   # add to ~/.zshrc
+export PATH="$HOME/path/to/folder/scripts:$PATH"   # add to ~/.zshrc
 ```
 
 ## Commands

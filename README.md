@@ -10,9 +10,14 @@ once this folder is on your `PATH`.
 ## Setup
 
 ```sh
-export PATH="$HOME/path/to/folder/scripts:$PATH"   # add to ~/.zshrc
-./bootstrap.sh                                     # creates the shared Python venv
+./bootstrap.sh    # creates the shared Python venv and adds this folder to PATH
 ```
+
+`bootstrap.sh` appends an `export PATH=...` line to `~/.zshrc` (zsh) or
+`~/.bashrc` (bash; `~/.bash_profile` on macOS), unless one is already there.
+If that file is a symlink (e.g. into a dotfiles repo), the line goes into the
+real file and the link is kept. Other shells get the line printed to add by
+hand. It is safe to re-run.
 
 ## Commands
 

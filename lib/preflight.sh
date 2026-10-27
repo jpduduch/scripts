@@ -31,7 +31,11 @@ preflight() {
     local venv_py="$PY_DIR/.venv/bin/python"
     local venv_missing=0 need_uv=0 missing_tools="" t
 
-    [ -x "$venv_py" ] || venv_missing=1
+    # The marker is written last by bootstrap.sh, so its absence means the
+    # install was interrupted or failed even if the interpreter exists.
+    if [ ! -x "$venv_py" ] || [ ! -f "$PY_DIR/.venv/.bootstrap-complete" ]; then
+        venv_missing=1
+    fi
     if [ "$venv_missing" -eq 1 ] && ! command -v uv >/dev/null 2>&1; then
         need_uv=1
     fi
@@ -54,7 +58,7 @@ preflight() {
             n=$((n + 1))
         fi
         if [ "$venv_missing" -eq 1 ]; then
-            echo "  $n) ambiente Python ausente em $PY_DIR/.venv"
+            echo "  $n) ambiente Python ausente ou incompleto em $PY_DIR/.venv"
             echo "     $SCRIPT_DIR/bootstrap.sh"
             n=$((n + 1))
         fi

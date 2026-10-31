@@ -1,4 +1,4 @@
-# Union of the PEP 723 inline dependencies declared by the two Python scripts.
+# Union of the PEP 723 inline dependencies declared by the Python scripts.
 # fetch-fonts.py
 requests>=2.31
 beautifulsoup4>=4.12
@@ -8,3 +8,7 @@ brotli>=1.1
 trafilatura>=1.12
 markdownify>=0.13
 Pillow>=10.0
+# fetch-subtitle.py
+subliminal>=2.3
+ffsubsync>=0.4.29
+pysubs2>=1.7

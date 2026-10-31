@@ -17,6 +17,9 @@ _pf_hint() {
         pandoc)
             if _pf_is_mac; then echo "brew install pandoc"
             else echo "sudo dnf install pandoc"; fi ;;
+        ffmpeg|ffprobe)
+            if _pf_is_mac; then echo "brew install ffmpeg"
+            else echo "sudo dnf install ffmpeg"; fi ;;
         magick)
             if _pf_is_mac; then echo "brew install imagemagick"
             else echo "sudo dnf install ImageMagick"; fi ;;

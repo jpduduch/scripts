@@ -26,6 +26,7 @@ hand. It is safe to re-run.
 | `url-to-md.sh <url>` | Converts an online article to Markdown or RTF. Consolidates same-prefix deeplinks into one file. | venv, `pandoc` (RTF only) |
 | `fetch-fonts.sh <url>` | Downloads the `@font-face` fonts a page uses, one folder per family. `--convert` decompresses woff/woff2 to `.otf`/`.ttf`. | venv |
 | `md-to-epub.sh` | Interactive Markdown to Kindle-friendly EPUB, with JetBrains Mono embedded and Mermaid blocks rendered to images. | `pandoc`, `magick` |
+| `fetch-subtitle.sh <movie>...` | Finds a subtitle for a movie online (OpenSubtitles.com, Podnapisi, BSPlayer, via subliminal) and syncs it to the movie's audio with ffsubsync. Saves `<movie>.pt-BR.srt` next to the file; `-l en` (repeatable) picks other languages. A subtitle that is already in sync is saved untouched; one that ffsubsync cannot align is skipped for the next candidate. OpenSubtitles.com needs a free account: see `--help`. | venv, `ffmpeg` |
 | `bd-burn.sh <folder> [device] [label]` | Burns a folder to BD-R/DVD/CD. **Linux only.** | `xorriso` |
 | `bd-overnight.sh <video>` | Overnight job: moves the video off an external drive into `~/Videos/temp` (then powers the drive down), and, **only if it is bigger than the Blu-ray in the drive**, shrinks it to fill the disc with two-pass 10-bit HEVC, burns it, verifies the burn by MD5 and powers the computer off. The x265 preset is chosen by test-encoding samples: the best VMAF among the presets projected to finish by `--deadline` (default 07:00), the slower one winning a tie. Audio and subtitles are copied untouched. **Linux only.** | `ffmpeg` with `libx265` + `libvmaf`, `xorriso`, `rsync`, `udisks2` |
 | `usb-autorun-installer.sh` | Copies videos off USB drives and discs into `~/Videos` after GNOME mounts them normally. Triggered by a `watch.txt` at the drive root, the label `TEMP`, or any disc; multi-part zip sets collect in `~/Videos/temp` and are extracted once complete. Ejects the disc or powers the drive down afterwards. **Linux only, needs `sudo`. Never replaces existing files.** | Fedora, GNOME/Wayland |
@@ -40,6 +41,7 @@ scripts/
 ├── bootstrap.sh              # one-time venv setup
 ├── url-to-md.sh              # wrapper -> lib/python/convert-url-to-md.py
 ├── fetch-fonts.sh            # wrapper -> lib/python/fetch-fonts.py
+├── fetch-subtitle.sh         # wrapper -> lib/python/fetch-subtitle.py
 ├── md-to-epub.sh             # bash, self-contained
 ├── bd-burn.sh                # bash, self-contained
 ├── bd-overnight.sh           # bash, self-contained
@@ -56,10 +58,11 @@ scripts/
         ├── requirements.lock # exact versions + hashes (what bootstrap installs)
         ├── convert-url-to-md.py
         ├── x_extract.py      # X/Twitter extractor, imported by the above
-        └── fetch-fonts.py
+        ├── fetch-fonts.py
+        └── fetch-subtitle.py
 ```
 
-The two Python scripts keep their PEP 723 inline metadata, so they still run
+The Python scripts keep their PEP 723 inline metadata, so they still run
 standalone under `uv run --script` if you ever need them outside this folder.
 
 ## Tests

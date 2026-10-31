@@ -27,6 +27,7 @@ hand. It is safe to re-run.
 | `fetch-fonts.sh <url>` | Downloads the `@font-face` fonts a page uses, one folder per family. `--convert` decompresses woff/woff2 to `.otf`/`.ttf`. | venv |
 | `md-to-epub.sh` | Interactive Markdown to Kindle-friendly EPUB, with JetBrains Mono embedded and Mermaid blocks rendered to images. | `pandoc`, `magick` |
 | `bd-burn.sh <folder> [device] [label]` | Burns a folder to BD-R/DVD/CD. **Linux only.** | `xorriso` |
+| `bd-overnight.sh <video>` | Overnight job: moves the video off an external drive into `~/Videos/temp` (then powers the drive down), and, **only if it is bigger than the Blu-ray in the drive**, shrinks it to fill the disc with two-pass 10-bit HEVC, burns it, verifies the burn by MD5 and powers the computer off. The x265 preset is chosen by test-encoding samples: the best VMAF among the presets projected to finish by `--deadline` (default 07:00), the slower one winning a tie. Audio and subtitles are copied untouched. **Linux only.** | `ffmpeg` with `libx265` + `libvmaf`, `xorriso`, `rsync`, `udisks2` |
 | `usb-autorun-installer.sh` | Copies videos off USB drives and discs into `~/Videos` after GNOME mounts them normally. Triggered by a `watch.txt` at the drive root, the label `TEMP`, or any disc; multi-part zip sets collect in `~/Videos/temp` and are extracted once complete. Ejects the disc or powers the drive down afterwards. **Linux only, needs `sudo`. Never replaces existing files.** | Fedora, GNOME/Wayland |
 | `migrate-fedora-settings.sh` | Exports dnf packages, flatpaks, GNOME extensions and dconf settings from one Fedora box and reinstalls them on another. **Linux only. Must be run from a pendrive** — it refuses to run from disk, and writes its export next to itself. | Fedora, `util-linux` |
 
@@ -41,6 +42,7 @@ scripts/
 ├── fetch-fonts.sh            # wrapper -> lib/python/fetch-fonts.py
 ├── md-to-epub.sh             # bash, self-contained
 ├── bd-burn.sh                # bash, self-contained
+├── bd-overnight.sh           # bash, self-contained
 ├── usb-autorun-installer.sh  # bash, self-contained
 ├── migrate-fedora-settings.sh # bash, self-contained (copy to a pendrive to use)
 └── lib/
@@ -69,8 +71,8 @@ lib/python/.venv/bin/python -m unittest discover -s lib/autorun/tests -v
 ## External tools
 
 `pandoc` and `imagemagick` come from `brew install pandoc imagemagick`.
-`xorriso` is Linux-only (`sudo dnf install xorriso`) — `bd-burn.sh` and
-`usb-autorun-installer.sh` are not usable on macOS.
+`xorriso` is Linux-only (`sudo dnf install xorriso`) — `bd-burn.sh`,
+`bd-overnight.sh` and `usb-autorun-installer.sh` are not usable on macOS.
 
 ## Dependency locking
 

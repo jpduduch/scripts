@@ -21,8 +21,13 @@
    - otherwise the corrected version is saved;
    - ffsubsync cannot align it: the next candidate is tried (--tries).
 
-The result is saved as <movie>.<lang>.srt next to the movie, which Jellyfin,
-Plex, Kodi and VLC all pick up automatically.
+4. Embeds the subtitles into the movie as selectable tracks (MKV with
+   mkvmerge, MP4/M4V/MOV with ffmpeg). Nothing is re-encoded. The new file is
+   written next to the movie, checked (duration, track count, size) and only
+   then swapped in; on any failure the original is left untouched and the
+   subtitle stays beside it as <movie>.<lang>.srt.
+   With --no-embed, only <movie>.<lang>.srt is written, which Jellyfin, Plex,
+   Kodi and VLC also pick up automatically.
 
 OpenSubtitles.com (by far the biggest source) needs a free account to
 download. Credentials come from OPENSUBTITLES_USERNAME/OPENSUBTITLES_PASSWORD,
@@ -38,6 +43,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -63,6 +69,10 @@ DEFAULT_PROVIDERS = ["opensubtitlescom", "podnapisi", "bsplayer"]
 REFINERS = ["hash", "metadata", "tmdb"]
 CREDENTIALS_FILE = (Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
                     / "fetch-subtitle" / "opensubtitles.conf")
+MKV_EXTS = {".mkv"}
+FFMPEG_EXTS = {".mp4", ".m4v", ".mov"}  # subtitles go in as mov_text
+# Room left over after writing a copy of the movie.
+SPACE_MARGIN = 512 * 1024 * 1024
 CACHE_FILE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "subliminal" / "cache.dbm"
 
 
@@ -89,17 +99,20 @@ def probe(movie: Path) -> dict:
     info = json.loads(out)
     streams = info.get("streams", [])
     return {
+        "video": [s for s in streams if s.get("codec_type") == "video"],
         "audio": [s for s in streams if s.get("codec_type") == "audio"],
         "subs": [s for s in streams if s.get("codec_type") == "subtitle"],
         "duration": float(info.get("format", {}).get("duration") or 0),
     }
 
 
-def check_movie(movie: Path, languages: list[Language]) -> None:
+def check_movie(movie: Path, languages: list[Language]) -> set[str]:
+    """Print what the movie has; return the alpha3 codes of its embedded subtitles."""
     info = probe(movie)
     if not info["audio"]:
         raise Fail(f"{movie.name} has no audio track, so there is nothing to sync against.")
 
+    embedded: set[str] = set()
     mins = int(info["duration"] // 60)
     eprint(f"  {len(info['audio'])} audio track(s), {mins} min")
 
@@ -112,6 +125,9 @@ def check_movie(movie: Path, languages: list[Language]) -> None:
         hit = lang is not None and any(lang.alpha3 == want.alpha3 for want in languages)
         mark = "  <- same language" if hit else ""
         eprint(f"  embedded subtitle: {tag} ({s.get('codec_name')}){mark}")
+        if lang is not None:
+            embedded.add(lang.alpha3)
+    return embedded
 
 
 def output_path(movie: Path, lang: Language) -> Path:
@@ -160,17 +176,27 @@ def max_shift(srt: Path, offset: float, scale: float) -> float:
     return max(abs(t * scale + offset - t) for t in ends)
 
 
-def process(movie: Path, video, pool: ProviderPool, lang: Language, opts) -> bool:
+def process(movie: Path, video, pool: ProviderPool, lang: Language, opts,
+            embedded: set[str]) -> tuple[bool, Path | None]:
+    """Find, download and sync one language.
+
+    Returns (ok, path of a synced .srt ready to embed, or None).
+    """
     dest = output_path(movie, lang)
-    if dest.exists() and not opts.force:
-        eprint(f"  {dest.name} already exists; use --force to replace it.")
-        return True
+    if not opts.force:
+        if dest.exists():
+            eprint(f"\n> [{lang}] {dest.name} already exists; use --force to replace it.")
+            return True, None
+        if opts.embed and lang.alpha3 in embedded:
+            eprint(f"\n> [{lang}] the movie already has an embedded {lang.name} subtitle; "
+                   f"use --force to add another.")
+            return True, None
 
     eprint(f"\n> [{lang}] searching...")
     candidates = ranked_candidates(pool, video, lang)
     if not candidates:
         eprint(f"  no {lang} subtitle found.")
-        return False
+        return False, None
 
     max_score = get_scores(video)["hash"]
     eprint(f"  {len(candidates)} candidate(s); trying up to {opts.tries}")
@@ -225,16 +251,120 @@ def process(movie: Path, video, pool: ProviderPool, lang: Language, opts) -> boo
                        f"(lines moved up to {shift:.2f}s)")
                 dest.write_bytes(fixed.read_bytes())
             eprint(f"  saved {dest}")
-            print(dest)  # stdout: the saved path, for piping
-            return True
+            return True, dest
 
     if best_unsynced is not None and opts.keep_unsynced:
         dest.write_bytes(best_unsynced)
+        # Kept beside the movie, never embedded: an unsynced subtitle should be
+        # easy to delete.
         eprint(f"  no candidate could be synced; saved the best one UNSYNCED: {dest}")
         print(dest)
-        return False
+        return False, None
     eprint(f"  no {lang} candidate could be synced; nothing saved (see --keep-unsynced).")
-    return False
+    return False, None
+
+
+# ---------------------------------------------------------------- 4. embedding
+
+def track_title(lang: Language) -> str:
+    country = getattr(lang, "country", None)
+    return f"{lang.name} ({country.name.title()})" if country else lang.name
+
+
+def mkvmerge_cmd(src: Path, out: Path, subs: list[tuple[Language, Path]]) -> list[str]:
+    cmd = ["mkvmerge", "--quiet", "-o", str(out)]
+    # Only the new subtitle should be shown by default.
+    info = json.loads(subprocess.run(["mkvmerge", "-J", str(src)], check=True,
+                                     capture_output=True, text=True).stdout)
+    for track in info.get("tracks", []):
+        if track.get("type") == "subtitles":
+            cmd += ["--default-track-flag", f"{track['id']}:no"]
+    cmd.append(str(src))
+    for i, (lang, srt) in enumerate(subs):
+        cmd += ["--language", f"0:{lang}", "--track-name", f"0:{track_title(lang)}",
+                "--default-track-flag", f"0:{'yes' if i == 0 else 'no'}",
+                "--sub-charset", "0:UTF-8", str(srt)]
+    return cmd
+
+
+def ffmpeg_cmd(src: Path, out: Path, subs: list[tuple[Language, Path]],
+               existing_subs: int) -> list[str]:
+    cmd = ["ffmpeg", "-v", "error", "-nostdin", "-i", str(src)]
+    for _, srt in subs:
+        cmd += ["-sub_charenc", "UTF-8", "-i", str(srt)]
+    cmd += ["-map", "0"]
+    for i in range(len(subs)):
+        cmd += ["-map", str(i + 1)]
+    cmd += ["-c", "copy", "-c:s", "mov_text", "-disposition:s", "0"]
+    for i, (lang, _) in enumerate(subs):
+        k = existing_subs + i
+        cmd += [f"-metadata:s:s:{k}", f"language={lang.alpha3}",  # MP4 takes ISO 639-2/T
+                f"-metadata:s:s:{k}", f"title={track_title(lang)}"]
+    cmd += ["-disposition:s:" + str(existing_subs), "default", str(out)]
+    return cmd
+
+
+def embed(movie: Path, subs: list[tuple[Language, Path]]) -> bool:
+    """Mux the subtitles into the movie in place. False leaves everything as it was."""
+    # Rewrite the real file, so a symlink to it keeps working.
+    target = movie.resolve()
+    ext = target.suffix.lower()
+    if ext not in MKV_EXTS | FFMPEG_EXTS:
+        eprint(f"  cannot embed subtitles in a {ext} file; keeping them beside it.")
+        return False
+    if ext in MKV_EXTS and not shutil.which("mkvmerge"):
+        eprint("  mkvmerge not found (sudo dnf install mkvtoolnix); keeping the subtitles beside it.")
+        return False
+
+    size = target.stat().st_size
+    free = shutil.disk_usage(target.parent).free
+    if free < size + SPACE_MARGIN:
+        eprint(f"  not enough free space to rewrite the movie ({free / 2**30:.1f} GiB free, "
+               f"{(size + SPACE_MARGIN) / 2**30:.1f} GiB needed); keeping the subtitles beside it.")
+        return False
+
+    before = probe(target)
+    tmp = target.with_name(f".{target.stem}.embedding{target.suffix}")
+    names = ", ".join(str(lang) for lang, _ in subs)
+    eprint(f"\n> embedding {names} into {target.name} ({size / 2**30:.1f} GiB, nothing re-encoded)...")
+    try:
+        if ext in MKV_EXTS:
+            proc = subprocess.run(mkvmerge_cmd(target, tmp, subs), capture_output=True, text=True)
+            failed = proc.returncode >= 2  # 1 = warnings only
+        else:
+            proc = subprocess.run(ffmpeg_cmd(target, tmp, subs, len(before["subs"])),
+                                  capture_output=True, text=True)
+            failed = proc.returncode != 0
+        if failed:
+            eprint(f"  muxing failed: {(proc.stdout + proc.stderr).strip()[-500:]}")
+            return False
+
+        after = probe(tmp)
+        problems = []
+        if len(after["subs"]) != len(before["subs"]) + len(subs):
+            problems.append(f"{len(after['subs'])} subtitle tracks, expected "
+                            f"{len(before['subs']) + len(subs)}")
+        if abs(after["duration"] - before["duration"]) > 1:
+            problems.append(f"duration {after['duration']:.1f}s, was {before['duration']:.1f}s")
+        if len(after["audio"]) != len(before["audio"]):
+            problems.append(f"{len(after['audio'])} audio tracks, was {len(before['audio'])}")
+        if len(after["video"]) != len(before["video"]):
+            problems.append(f"{len(after['video'])} video tracks, was {len(before['video'])}")
+        # Muxers pack differently, so a few % either way is normal; a truncated
+        # file is caught by the duration check, this only catches lost streams.
+        if tmp.stat().st_size < size * 0.9:
+            problems.append(f"the new file is {tmp.stat().st_size / size:.0%} of the original's size")
+        if problems:
+            eprint("  the new file does not check out (" + "; ".join(problems) +
+                   "); the original was not touched.")
+            return False
+
+        shutil.copymode(target, tmp)
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+    eprint(f"  done: {len(after['subs'])} subtitle track(s) in {target.name}")
+    return True
 
 
 # ---------------------------------------------------------------------- main
@@ -265,7 +395,8 @@ def parse_language(code: str) -> Language:
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="fetch-subtitle.sh",
-        description="Download a subtitle for a movie and sync it to the movie's audio.",
+        description="Download a subtitle for a movie, sync it to the movie's audio "
+                    "and embed it in the file as a selectable track.",
         epilog=f"OpenSubtitles.com needs a free account to download. Set "
                f"OPENSUBTITLES_USERNAME and OPENSUBTITLES_PASSWORD, or write "
                f"'username = ...' and 'password = ...' lines to {CREDENTIALS_FILE} "
@@ -276,7 +407,10 @@ def main() -> int:
                     help=f"subtitle language as an IETF code (pt-BR, pt, en, es...). "
                          f"Repeat for several. Default: {DEFAULT_LANGUAGE}")
     ap.add_argument("-f", "--force", action="store_true",
-                    help="replace an existing <movie>.<lang>.srt")
+                    help="fetch even if the movie already has a subtitle in that language "
+                         "(embedded or <movie>.<lang>.srt)")
+    ap.add_argument("--no-embed", dest="embed", action="store_false",
+                    help="leave the movie untouched; only save <movie>.<lang>.srt beside it")
     ap.add_argument("-n", "--tries", type=int, default=3,
                     help="how many candidates to try before giving up (default: 3)")
     ap.add_argument("-t", "--tolerance", type=float, default=0.15,
@@ -322,10 +456,22 @@ def main() -> int:
             try:
                 if not movie.is_file():
                     raise Fail(f"not a file: {movie}")
-                check_movie(movie, languages)
+                embedded = check_movie(movie, languages)
                 video = identify(movie)
+                ready: list[tuple[Language, Path]] = []
                 for lang in languages:
-                    ok &= process(movie, video, pool, lang, opts)
+                    lang_ok, srt = process(movie, video, pool, lang, opts, embedded)
+                    ok &= lang_ok
+                    if srt:
+                        ready.append((lang, srt))
+                # All languages in one pass: rewriting a 50 GB remux once is enough.
+                if ready and opts.embed and embed(movie, ready):
+                    for _, srt in ready:
+                        srt.unlink()  # now inside the movie; a copy beside it would show twice
+                    print(movie)  # stdout: what was written, for piping
+                else:
+                    for _, srt in ready:
+                        print(srt)
             except (Fail, ValueError) as exc:
                 eprint(f"  error: {exc}")
                 ok = False

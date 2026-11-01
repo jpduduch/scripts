@@ -27,8 +27,9 @@ hand. It is safe to re-run.
 | `fetch-fonts.sh <url>` | Downloads the `@font-face` fonts a page uses, one folder per family. `--convert` decompresses woff/woff2 to `.otf`/`.ttf`. | venv |
 | `md-to-epub.sh` | Interactive Markdown to Kindle-friendly EPUB, with JetBrains Mono embedded and Mermaid blocks rendered to images. | `pandoc`, `magick` |
 | `fetch-subtitle.sh <movie>...` | Finds a subtitle for a movie online (OpenSubtitles.com, Podnapisi, BSPlayer, via subliminal), syncs it to the movie's audio with ffsubsync and **embeds it in the file** as a selectable, default track; nothing is re-encoded. The rewritten file is checked (duration, track counts, size) before it replaces the original, which needs free space for one copy of the movie. MKV goes through `mkvmerge` (keeps Dolby Vision, chapters, attachments), MP4/M4V/MOV through ffmpeg; other formats, or `--no-embed`, keep `<movie>.<lang>.srt` beside the file instead. Default language pt-BR; `-l en` (repeatable) picks others. OpenSubtitles.com needs a free account: see `--help`. | venv, `ffmpeg`, `mkvtoolnix` (MKV) |
-| `bd-burn.sh <folder> [device] [label]` | Burns a folder to BD-R/DVD/CD. **Linux only.** | `xorriso` |
-| `bd-overnight.sh <video>` | Overnight job: moves the video off an external drive into `~/Videos/temp` (then powers the drive down), and, **only if it is bigger than the Blu-ray in the drive**, shrinks it to fill the disc with two-pass 10-bit HEVC, burns it, verifies the burn by MD5 and powers the computer off. The x265 preset is chosen by test-encoding samples: the best VMAF among the presets projected to finish by `--deadline` (default 07:00), the slower one winning a tie. Audio and subtitles are copied untouched. **Linux only.** | `ffmpeg` with `libx265` + `libvmaf`, `xorriso`, `rsync`, `udisks2` |
+| `bd-burn.sh <file-or-folder> [device] [label]` | Burns a file or a folder's contents to BD-R/DVD/CD, then reads the disc back and checks every file against the MD5 recorded with it. Checks the fit first (filesystem overhead included); a used disc gets a new session and nothing on it is overwritten. `--yes` asks nothing, `--name` renames a file on the disc, `--speed 4` caps the burn speed (safer on USB drives), `--free`/`--check` only report. Exit 3 means it does not fit. Messages in Portuguese. **Linux only.** | `xorriso` |
+| `bd-encode.sh <video>` | Shrinks a video just enough to fill the disc in the drive, as 10-bit HEVC, and prints the encode's path. Audio and subtitles are copied untouched. Picks the least destructive encoder whose encode plus burn fits in `--hours` (default 8): x265 *slow*, else NVENC (GPU), each timed on a short clip first; `--estimate` shows the timing, `--preset` forces one. A video that already fits is left alone (exit 3); an encode left by an earlier run is reused. **Linux only.** | `ffmpeg` with `libx265` (NVENC optional), `bd-burn.sh` |
+| `bd-overnight.sh <video>` | The overnight job, wrapping the two above: asks the disc label, moves the video off an external drive into `~/Videos/temp` (then powers the drive down), runs `bd-encode.sh` within 8 hours, burns with `bd-burn.sh`, deletes the encode once the burn is verified and powers the computer off. A video that already fits is not burned, and the computer stays on. After a failed burn the encode is kept and the next run burns it without encoding again. **Linux only.** | `bd-encode.sh`, `bd-burn.sh`, `rsync`, `udisks2` |
 | `usb-autorun-installer.sh` | Copies videos off USB drives and discs into `~/Videos` after GNOME mounts them normally. Triggered by a `watch.txt` at the drive root, the label `TEMP`, or any disc; multi-part zip sets collect in `~/Videos/temp` and are extracted once complete. Ejects the disc or powers the drive down afterwards. **Linux only, needs `sudo`. Never replaces existing files.** | Fedora, GNOME/Wayland |
 | `migrate-fedora-settings.sh` | Exports dnf packages, flatpaks, GNOME extensions and dconf settings from one Fedora box and reinstalls them on another. **Linux only. Must be run from a pendrive** — it refuses to run from disk, and writes its export next to itself. | Fedora, `util-linux` |
 
@@ -44,7 +45,8 @@ scripts/
 ├── fetch-subtitle.sh         # wrapper -> lib/python/fetch-subtitle.py
 ├── md-to-epub.sh             # bash, self-contained
 ├── bd-burn.sh                # bash, self-contained
-├── bd-overnight.sh           # bash, self-contained
+├── bd-encode.sh              # bash; asks bd-burn.sh about the disc
+├── bd-overnight.sh           # bash; wraps bd-encode.sh + bd-burn.sh
 ├── usb-autorun-installer.sh  # bash, self-contained
 ├── migrate-fedora-settings.sh # bash, self-contained (copy to a pendrive to use)
 └── lib/
@@ -75,7 +77,8 @@ lib/python/.venv/bin/python -m unittest discover -s lib/autorun/tests -v
 
 `pandoc` and `imagemagick` come from `brew install pandoc imagemagick`.
 `xorriso` is Linux-only (`sudo dnf install xorriso`) — `bd-burn.sh`,
-`bd-overnight.sh` and `usb-autorun-installer.sh` are not usable on macOS.
+`bd-encode.sh`, `bd-overnight.sh` and `usb-autorun-installer.sh` are not usable
+on macOS.
 
 ## Dependency locking
 

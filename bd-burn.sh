@@ -8,7 +8,12 @@
 # Um disco com sessoes anteriores ganha uma sessao nova: o que ja esta nele
 # continua la, e um nome que ja existe no disco nao e sobrescrito.
 #
+# Com --each, cada arquivo vai num disco proprio (os volumes NOME.zip.001,
+# .002, ... do bd-split.sh): entre um e outro, espera o proximo disco em
+# branco. O caminho de cada arquivo gravado e conferido sai no stdout.
+#
 # Uso: bd-burn.sh [opcoes] ORIGEM [dispositivo] [rotulo]   (veja --help)
+#      bd-burn.sh [opcoes] --each ARQUIVO...
 
 set -euo pipefail
 # Ponto decimal, seja qual for o idioma do sistema.
@@ -22,6 +27,8 @@ YES=no
 SPEED=""
 EJECT=yes
 MODE=burn
+EACH=no
+FILES=()
 
 # O que fica livre depois de gravar: o xorriso avisa que o numero real pode
 # ser alguns MB menor que o previsto.
@@ -29,19 +36,32 @@ SLACK=$((16 * 1024 * 1024))
 # ISO nivel 3 aceita arquivos acima de 4 GiB; Joliet com nomes longos.
 ISO_OPTS=(-joliet on -compliance iso_9660_level=3:joliet_long_names)
 NO_FIT=3
+# Com --yes, de quanto em quanto tempo olha se o proximo disco ja entrou.
+POLL_SECONDS=30
 
 log() { printf '[bd-burn %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "ERRO: $1"; exit "${2:-1}"; }
 human() { awk -v b="$1" 'BEGIN { printf "%.2f GiB", b / 1073741824 }'; }
+notify() {
+    command -v notify-send >/dev/null || return 0
+    notify-send --app-name="bd-burn" --urgency=critical -- "$1" "$2" 2>/dev/null || true
+}
 
 usage() {
     cat <<HELP
 Uso: ${0##*/} [opcoes] ORIGEM [dispositivo] [rotulo]
+     ${0##*/} [opcoes] --each ARQUIVO...
 
 Grava ORIGEM num disco otico e confere a gravacao lendo o disco de volta.
   ORIGEM pasta    o conteudo dela vai pra raiz do disco
   ORIGEM arquivo  vai pra raiz do disco (com --name, com outro nome)
 Um disco ja usado ganha uma sessao nova; nada que esta nele e sobrescrito.
+
+Com --each, cada ARQUIVO vai num disco proprio, na ordem dada (os volumes
+NOME.zip.001, .002, ... do bd-split.sh). Depois de cada disco, ejeta e espera
+o proximo: pergunta, ou com --yes avisa e fica olhando o drive ate entrar um
+disco onde caiba. Cada arquivo gravado e conferido tem o caminho impresso no
+stdout. O rotulo de cada disco termina no numero do volume (_1, _2, ...).
 
 Opcoes:
   --device DEV   drive (padrao: /dev/sr0, senao o primeiro /dev/sr*);
@@ -55,6 +75,7 @@ Opcoes:
   -y, --yes      nao pergunta nada
   --free         so mostra o espaco livre no disco, em bytes, e sai
   --check        so diz se ORIGEM cabe no disco, e sai (0 cabe, 3 nao cabe)
+  --each         um disco pra cada ARQUIVO (veja acima)
   -h, --help     este texto
 
 Saida: 0 gravado e conferido; 3 nao cabe; 1 qualquer outro erro.
@@ -79,11 +100,24 @@ parse_args() {
             --no-eject) EJECT=no; shift ;;
             --free) MODE=free; shift ;;
             --check) MODE=check; shift ;;
+            --each) EACH=yes; shift ;;
             --) shift; pos+=("$@"); break ;;
             -*) die "Opcao desconhecida: $1 (veja --help)." ;;
             *) pos+=("$1"); shift ;;
         esac
     done
+    if [[ $EACH == yes ]]; then
+        [[ $MODE == burn ]] || die "--each nao combina com --free nem --check."
+        [[ -z $NAME ]] || die "--each nao aceita --name: cada arquivo vai com o proprio nome."
+        [[ ${#pos[@]} -ge 1 ]] || { usage >&2; exit 1; }
+        local file
+        for file in "${pos[@]}"; do
+            [[ -f $file ]] || die "'$file' nao e um arquivo."
+            FILES+=("$(realpath -- "$file")")
+        done
+        [[ -z $SPEED || $SPEED =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--speed quer um numero, ex.: 4"
+        return 0
+    fi
     # Forma antiga, que continua valendo: ORIGEM [dispositivo] [rotulo].
     [[ ${#pos[@]} -le 3 ]] || die "Argumentos demais (veja --help)."
     SRC=${pos[0]:-}
@@ -204,6 +238,78 @@ verify() {
     log "Conferido: tudo o que foi gravado bate com o MD5."
 }
 
+# ------------------------------------------------------------- um por disco
+
+# O numero do disco de ARQUIVO: o do volume (NOME.zip.002 -> 2), senao a ordem.
+disc_number() {
+    local name=${1##*/}
+    if [[ $name =~ \.([0-9]{3,})$ ]]; then
+        echo $((10#${BASH_REMATCH[1]}))
+    else
+        echo "$2"
+    fi
+}
+
+# Espera ate ter no drive um disco gravavel onde ORIGEM caiba.
+wait_for_disc() {
+    local what=$1 after told=no
+    while :; do
+        if media_free 2>/dev/null && after=$(space_after 2>/dev/null) && (( after >= SLACK )); then
+            return 0
+        fi
+        if [[ $YES == no ]]; then
+            ask "Coloque um disco em branco pra $what e tecle Enter (Ctrl-C para): " >/dev/null
+        else
+            if [[ $told == no ]]; then
+                log "Esperando um disco em branco pra $what (olhando o drive a cada ${POLL_SECONDS}s)..."
+                notify "Troque o disco" "Coloque um disco em branco pra $what."
+                told=yes
+            fi
+            sleep "$POLL_SECONDS"
+        fi
+    done
+}
+
+main_each() {
+    local n=${#FILES[@]} i k base what
+    # O rotulo-base vem do primeiro arquivo, sem .zip.001 e afins.
+    if [[ -z $LABEL ]]; then
+        base=${FILES[0]##*/}
+        [[ ! $base =~ ^(.+)\.zip\.[0-9]{3,}$ ]] || base=${BASH_REMATCH[1]}
+        base=${base%.*}
+        base=${base//[^A-Za-z0-9_-]/_}
+        base=${base:0:27}
+        if [[ $YES == no ]]; then
+            LABEL=$(ask "Rotulo dos discos (cada um ganha _1, _2, ...) [$base]: ")
+        fi
+        LABEL=${LABEL:-$base}
+    fi
+    base=${LABEL:0:27}
+    [[ $base == "$LABEL" ]] || log "O rotulo foi cortado em 27 caracteres, pra caber o numero do disco: $base"
+    if [[ $YES == no ]]; then
+        [[ $(ask "Gravar $n disco(s) em $DEV? [s/N] ") =~ ^[sS]$ ]] || { log "Cancelado."; exit 0; }
+    fi
+    for ((i = 0; i < n; i++)); do
+        SRC=${FILES[i]}
+        NAME=${SRC##*/}
+        k=$(disc_number "$SRC" $((i + 1)))
+        LABEL="${base}_$k"
+        what="$NAME ($((i + 1)) de $n)"
+        wait_for_disc "$what"
+        log "Disco pra $what: rotulo '$LABEL', $(human "$(source_bytes)") num disco com $(human "$FREE") livres."
+        burn
+        verify
+        # O proximo disco precisa da bandeja aberta; o ultimo segue o --no-eject.
+        if [[ $EJECT == yes || $i -lt $((n - 1)) ]]; then
+            xorriso -outdev "$DEV" -eject all >/dev/null 2>&1 || true
+        fi
+        printf '%s\n' "$SRC"
+        log "Disco $((i + 1)) de $n gravado e conferido."
+        (( i == n - 1 )) || notify "Disco $((i + 1)) de $n pronto" "Coloque o proximo disco em branco."
+    done
+    log "Pronto: $n disco(s) gravado(s) e conferido(s)."
+}
+
 # ---------------------------------------------------------------------- main
 
 ask() {
@@ -220,6 +326,11 @@ main() {
     if [[ $MODE == burn && -z ${BD_INHIBITED:-} ]] && command -v systemd-inhibit >/dev/null; then
         BD_INHIBITED=1 exec systemd-inhibit --what=sleep:idle --who=bd-burn \
             --why="Gravando um disco" bash "${BASH_SOURCE[0]}" "$@"
+    fi
+
+    if [[ $EACH == yes ]]; then
+        main_each
+        return 0
     fi
 
     media_free || die "Nao tem disco gravavel em $DEV (ausente, fechado ou nao gravavel?)."

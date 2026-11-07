@@ -6,9 +6,14 @@
 # Linux (Fedora/GNOME) only.
 #
 #   1. The disc's free space is read (via bd-burn.sh). No writable disc: stop.
-#   2. A video that already fits on the disc is left alone (exit 3).
-#   3. The HEVC bitrate that fills the disc is worked out from the duration and
-#      the size of the audio/subtitles, which are copied as they are.
+#   2. The number of discs is chosen: one fewer than the video takes as it is
+#      (so a 2-disc video goes onto 1, a 4-disc one onto 3), or --discs. More
+#      than one disc means the encode is then split into zip volumes, one per
+#      disc, with bd-split.sh; every disc is taken to match the one in the drive.
+#      A video that already fits on that many discs is left alone (exit 3).
+#   3. The HEVC bitrate that fills those discs is worked out from the duration
+#      and the size of the audio/subtitles, which are copied as they are. How
+#      much fits, zip headers included, is bd-split.sh's answer (--payload).
 #   4. Each encoder is timed on a short clip of the film. Least destructive
 #      first: x265 slow, then NVENC (the GPU); the first one projected to finish
 #      within the window, burn time included, is used. If neither does, NVENC
@@ -25,9 +30,11 @@ export LC_NUMERIC=C
 
 SCRIPT_DIR=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")
 BD_BURN="$SCRIPT_DIR/bd-burn.sh"
+BD_SPLIT="$SCRIPT_DIR/bd-split.sh"
 
 DEVICE=""
 HOURS=8
+DISCS=""
 FORCE_PRESET=""
 OUTPUT=""
 ESTIMATE_ONLY=no
@@ -44,12 +51,12 @@ PROBE_MAX_SECONDS=90
 # Timing a short clip is a rough guide; pad the projection.
 PROJECTION_PAD=1.10
 
-# bd-burn.sh keeps this much free after a burn; it is set aside twice here, the
-# second time for the ISO metadata itself.
-FS_RESERVE=$((16 * 1024 * 1024))
 SIZE_SAFETY_PERMILLE=20              # muxing overhead and rate-control error
 BURN_BYTES_PER_SEC=$((18 * 1000 * 1000))  # BD 4x; writing and reading back
 BURN_FIXED_SECONDS=600               # spin-up, lead-in, closing the session
+SPLIT_BYTES_PER_SEC=$((150 * 1000 * 1000))  # bd-split: writing, then testing
+# The plan lists at most this many disc counts below what the video takes.
+PLAN_ROWS=6
 MIN_VIDEO_KBPS=300
 ALREADY_FITS=3
 
@@ -69,17 +76,22 @@ prints the path of the encode. Audio and subtitles are copied as they are.
 The encoder is the least destructive one (x265 slow, else NVENC) that lets the
 encode plus the burn finish within --hours; each is timed on a short clip first.
 
+A video that takes several discs as it is is shrunk to fill one disc fewer;
+split the encode with bd-split.sh afterwards, one volume per disc. Every disc
+is taken to be blank and the same size as the one in the drive.
+
 Options:
   --device DEV   optical drive (default: /dev/sr0, else the first /dev/sr*);
                  stdio:/path/file.iso uses an image file instead (testing)
+  --discs N      fill N discs (default: one fewer than VIDEO takes as it is)
   --hours H      time window for encode + burn, from now (default $HOURS)
   --preset NAME  skip the choice: an x265 preset (slow, medium, ...) or nvenc
   --output FILE  where the encode goes (default ~/Videos/temp/NAME.bd.mkv)
   --estimate     time the encoders and show the choice, then stop
   -h, --help     this text
 
-Exit status: 0 encoded (path on stdout); 3 VIDEO already fits on the disc, so
-nothing was done; 1 any other error.
+Exit status: 0 encoded (path on stdout); 3 VIDEO already fits on the discs as
+it is, so nothing was done; 1 any other error.
 HELP
 }
 
@@ -275,6 +287,48 @@ choose_preset() {
     fi
 }
 
+# -------------------------------------------------------------------- plan
+
+# The encode size that fills N discs, with the safety margin.
+target_for() {
+    local payload
+    payload=$("$BD_SPLIT" "${DEV_ARGS[@]}" --payload "$1") ||
+        die "Cannot work out how much fits on $1 disc(s)."
+    awk -v p="$payload" -v s="$SIZE_SAFETY_PERMILLE" 'BEGIN { printf "%d", p * (1 - s / 1000) }'
+}
+
+kbps_for() {
+    awk -v t="$1" -v c="$2" -v d="$DURATION" 'BEGIN { printf "%d", (t - c) * 8 / d / 1000 }'
+}
+
+# Shows what each disc count below NEEDED would give, and the chosen one disc
+# by disc. Sets VOLUME, the bytes one disc holds.
+show_plan() {
+    local needed=$1 copied=$2 target=$3 n t kbps mark last i
+    local -a sizes=()
+    VOLUME=$("$BD_SPLIT" "${DEV_ARGS[@]}" --payload 1) || die "Cannot read the disc size."
+    log "${VIDEO##*/} is $(human "$(stat -c %s -- "$VIDEO")"), $(human "$copied") of it audio/subtitles (copied as-is): $needed discs as it is."
+    for ((n = needed - 1; n >= 1 && n >= needed - PLAN_ROWS; n--)); do
+        if (( n == DISCS )); then t=$target; else t=$(target_for "$n"); fi
+        kbps=$(kbps_for "$t" "$copied")
+        mark=''
+        (( n != DISCS )) || mark='  <- chosen'
+        (( kbps >= MIN_VIDEO_KBPS )) || mark="$mark  (too little for the picture)"
+        log "$(printf '  %2d disc%s: ~%s, video %6.1f Mb/s%s' "$n" "$( ((n > 1)) && echo s || echo ' ')" \
+            "$(human "$t")" "$(awk -v k="$kbps" 'BEGIN { print k / 1000 }')" "$mark")"
+    done
+    if (( DISCS == 1 )); then
+        log "Plan: ~$(human "$target") on 1 disc, video ${VIDEO_KBPS} kb/s."
+        return 0
+    fi
+    for ((i = 1; i < DISCS; i++)); do sizes+=("$(human "$VOLUME")"); done
+    last=$((target - (DISCS - 1) * VOLUME))
+    sizes+=("$(human "$last")")
+    local joined
+    joined=$(IFS='+'; echo "${sizes[*]}")
+    log "Plan: ~$(human "$target") on $DISCS discs (${joined//+/ + }), video ${VIDEO_KBPS} kb/s; split with bd-split.sh."
+}
+
 # ------------------------------------------------------------------- main
 
 parse_args() {
@@ -282,10 +336,10 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case $1 in
             -h|--help) usage; exit 0 ;;
-            --device|--hours|--preset|--output)
+            --device|--discs|--hours|--preset|--output)
                 [[ $# -ge 2 && -n $2 ]] || die "Missing value for $1."
                 case $1 in
-                    --device) DEVICE=$2 ;; --hours) HOURS=$2 ;;
+                    --device) DEVICE=$2 ;; --discs) DISCS=$2 ;; --hours) HOURS=$2 ;;
                     --preset) FORCE_PRESET=$2 ;; --output) OUTPUT=$2 ;;
                 esac
                 shift 2 ;;
@@ -298,6 +352,7 @@ parse_args() {
     [[ -f $VIDEO ]] || die "Not a file: $VIDEO"
     VIDEO=$(realpath -- "$VIDEO")
     [[ $HOURS =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--hours wants a number, e.g. 8 or 6.5"
+    [[ -z $DISCS || $DISCS =~ ^[1-9][0-9]*$ ]] || die "--discs wants a number of discs, e.g. 3"
     if [[ -n $FORCE_PRESET && $FORCE_PRESET != nvenc &&
         " ${X265_PRESETS[*]} " != *" $FORCE_PRESET "* ]]; then
         die "Unknown preset: $FORCE_PRESET (an x265 preset, or nvenc)."
@@ -310,6 +365,7 @@ preflight() {
         command -v "$bin" >/dev/null || die "Missing command: $bin"
     done
     [[ -x $BD_BURN ]] || die "bd-burn.sh is missing next to this script: $BD_BURN"
+    [[ -x $BD_SPLIT ]] || die "bd-split.sh is missing next to this script: $BD_SPLIT"
     # Captured first: grep -q quitting early would SIGPIPE ffmpeg under pipefail.
     caps=$(ffmpeg -hide_banner -encoders 2>/dev/null) || caps=''
     grep -q ' libx265 ' <<< "$caps" ||
@@ -334,22 +390,30 @@ main() {
 
     local -a dev=()
     [[ -z $DEVICE ]] || dev=(--device "$DEVICE")
+    DEV_ARGS=("${dev[@]}")
     local free
     free=$("$BD_BURN" --free "${dev[@]}") || die "No writable disc in the drive."
     log "Disc free space: $(human "$free")."
 
     [[ $(probe -select_streams V:0 -show_entries stream=codec_type) == video ]] ||
         die "No video stream in $VIDEO."
-    local name=${VIDEO##*/} stem rc=0
+    local name=${VIDEO##*/} stem needed payload
     stem=${name%.*}
-    "$BD_BURN" --check "${dev[@]}" --name "$name" "$VIDEO" 2>/dev/null || rc=$?
-    case $rc in
-        0)
+    needed=$("$BD_SPLIT" "${dev[@]}" --discs-needed "$VIDEO") ||
+        die "Cannot work out how many discs $name takes."
+    if [[ -z $DISCS ]]; then
+        DISCS=$((needed > 1 ? needed - 1 : 1))
+    fi
+    if (( needed <= DISCS )); then
+        if (( needed == 1 )); then
             log "$name ($(human "$(stat -c %s -- "$VIDEO")")) already fits on the disc. Nothing to do."
-            exit "$ALREADY_FITS" ;;
-        3) ;;
-        *) die "Cannot work out whether $name fits on the disc." ;;
-    esac
+        else
+            log "$name ($(human "$(stat -c %s -- "$VIDEO")")) already fits on $needed discs; split it as it is with bd-split.sh. Nothing to do."
+        fi
+        exit "$ALREADY_FITS"
+    fi
+    payload=$("$BD_SPLIT" "${dev[@]}" --payload "$DISCS") ||
+        die "Cannot work out how much fits on $DISCS discs."
 
     DURATION=$(duration_of "$VIDEO")
     [[ $DURATION =~ ^[0-9.]+$ ]] || die "Cannot read the duration of $name."
@@ -364,6 +428,8 @@ main() {
         log "Found an encode from an earlier run; checking it reads through to the end..."
         encode_complete "$OUTPUT" full ||
             die "$OUTPUT is left from an earlier run but is not a complete encode of $name; remove it to encode again."
+        (( $(stat -c %s -- "$OUTPUT") <= payload )) ||
+            die "$OUTPUT is left from an earlier run but does not fit on $DISCS disc(s); it was made for more. Remove it to encode again, or pass --discs."
         log "Reusing the encode from an earlier run: $OUTPUT ($(human "$(stat -c %s -- "$OUTPUT")")); not encoding again."
         [[ $ESTIMATE_ONLY == yes ]] || printf '%s\n' "$OUTPUT"
         exit 0
@@ -373,15 +439,21 @@ main() {
         awk -F/ -v d="$DURATION" '{ printf "%d", d * ($2 > 0 ? $1 / $2 : $1) }')
     local copied target
     copied=$(copied_stream_bytes)
-    target=$(awk -v f="$free" -v r="$FS_RESERVE" -v s="$SIZE_SAFETY_PERMILLE" \
-        'BEGIN { printf "%d", (f - 2 * r) * (1 - s / 1000) }')
+    target=$(awk -v p="$payload" -v s="$SIZE_SAFETY_PERMILLE" \
+        'BEGIN { printf "%d", p * (1 - s / 1000) }')
     VIDEO_KBPS=$(awk -v t="$target" -v c="$copied" -v d="$DURATION" \
         'BEGIN { printf "%d", (t - c) * 8 / d / 1000 }')
-    log "$name is $(human "$(stat -c %s -- "$VIDEO")"); target $(human "$target") ($(human "$copied") of it audio/subtitles, copied as-is)."
+    show_plan "$needed" "$copied" "$target"
     (( VIDEO_KBPS >= MIN_VIDEO_KBPS )) ||
         die "That leaves only ${VIDEO_KBPS} kb/s for the picture; too little to be worth it."
-    log "Video bitrate: ${VIDEO_KBPS} kb/s."
-    BURN_SECONDS=$((2 * target / BURN_BYTES_PER_SEC + BURN_FIXED_SECONDS))
+    # Only the first disc burns unattended; the rest wait for someone to swap
+    # discs, so the window counts the split and that one disc.
+    if (( DISCS == 1 )); then
+        BURN_SECONDS=$((2 * target / BURN_BYTES_PER_SEC + BURN_FIXED_SECONDS))
+    else
+        BURN_SECONDS=$((target / SPLIT_BYTES_PER_SEC +
+            2 * VOLUME / BURN_BYTES_PER_SEC + BURN_FIXED_SECONDS))
+    fi
 
     # x265 stats and timing scratch go on the same disk as the videos.
     WORK=$(mktemp -d "$temp_dir/.bd-encode.XXXXXX")
@@ -398,6 +470,8 @@ main() {
         exit 0
     fi
     encode "$PRESET" "$OUTPUT"
+    (( DISCS == 1 )) ||
+        log "Fills $DISCS discs once split: bd-split.sh ${dev[*]} '$OUTPUT', then bd-burn.sh --each on the volumes."
     printf '%s\n' "$OUTPUT"
 }
 

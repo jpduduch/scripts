@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
 # bd-overnight.sh - the overnight job: fits a video onto the disc in the drive
-# and burns it, then powers the computer off. A thin wrapper around
-# bd-encode.sh and bd-burn.sh, which also work on their own.
-# Linux (Fedora/GNOME) only.
+# (or onto several, one fewer than it takes as it is) and burns it, then powers
+# the computer off. A thin wrapper around bd-encode.sh, bd-split.sh and
+# bd-burn.sh, which also work on their own. Linux (Fedora/GNOME) only.
 #
 #   1. Asks for the disc label up front, so nothing is left to ask later.
 #   2. Checks there is a writable disc, before anything is moved.
@@ -12,12 +12,19 @@
 #      down. A source on an internal disk is used where it is.
 #   4. bd-encode.sh shrinks it to fill the disc, choosing the least destructive
 #      encoder that lets encode + burn finish within the window (default 8 h).
-#      A video that already fits is left alone: nothing is burned, and the
-#      computer stays on.
-#   5. bd-burn.sh burns the encode under the label and reads it back against
-#      its MD5. Only then is the encode deleted and the computer powered off.
-#      After a failed burn the encode is kept, and the next run burns it as it
-#      is, without encoding again.
+#      A video that takes several discs is shrunk onto one fewer (or --discs).
+#      A video that already fits on one disc is left alone: nothing is burned,
+#      and the computer stays on.
+#   5. One disc: bd-burn.sh burns the encode under the label and reads it back
+#      against its MD5. Only then is the encode deleted and the computer
+#      powered off. After a failed burn the encode is kept, and the next run
+#      burns it as it is, without encoding again.
+#   6. Several discs: bd-split.sh splits the encode into zip volumes in
+#      ~/Videos/temp/NAME.discs, and the encode is deleted. bd-burn.sh --each
+#      burns the first disc, then waits, watching the drive, for each next
+#      blank disc (a notification asks for it). Each volume is deleted once its
+#      disc is verified; the computer powers off after the last. A rerun after
+#      a failure burns the volumes still there, without encoding again.
 #
 # Usage: bd-overnight.sh [options] VIDEO     (see --help)
 
@@ -27,11 +34,13 @@ export LC_NUMERIC=C
 SCRIPT_DIR=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")
 BD_ENCODE="$SCRIPT_DIR/bd-encode.sh"
 BD_BURN="$SCRIPT_DIR/bd-burn.sh"
+BD_SPLIT="$SCRIPT_DIR/bd-split.sh"
 
 DEVICE=""
 HOURS=8
 LABEL=""
 PRESET=""
+DISCS=""
 SPEED=""
 SHUTDOWN=yes
 ALREADY_FITS=3
@@ -53,11 +62,19 @@ into ~/Videos/temp, shrinks it to fill the disc in the drive (bd-encode.sh),
 burns and verifies it (bd-burn.sh), deletes the encode and powers off. A VIDEO
 that already fits on the disc is left alone, and the computer stays on.
 
+A VIDEO that takes several discs is shrunk onto one disc fewer, split into zip
+volumes (bd-split.sh) and burned one per disc: the first right away, each next
+one once a blank disc goes in (a notification asks for it). Every disc is taken
+to be the same size as the one in the drive. A rerun after a failure carries
+on with the discs still to burn.
+
 Options:
   --device DEV   optical drive (default: /dev/sr0, else the first /dev/sr*);
                  stdio:/path/file.iso writes an image file instead (testing)
   --label TEXT   disc label, up to 32 characters (default: asked first)
-  --hours H      encode + burn must fit in this many hours (default $HOURS)
+  --discs N      fill N discs (default: one fewer than VIDEO takes as it is)
+  --hours H      encode + burn must fit in this many hours (default $HOURS);
+                 with several discs, only the first one's burn is counted
   --preset NAME  skip the encoder choice: an x265 preset, or nvenc
   --speed N      burn at most at Nx (e.g. 4); default: the drive's maximum
   --no-shutdown  leave the computer on afterwards
@@ -159,11 +176,11 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case $1 in
             -h|--help) usage; exit 0 ;;
-            --device|--label|--hours|--preset|--speed)
+            --device|--label|--discs|--hours|--preset|--speed)
                 [[ $# -ge 2 && -n $2 ]] || die "Missing value for $1."
                 case $1 in
                     --device) DEVICE=$2 ;; --label) LABEL=$2 ;; --hours) HOURS=$2 ;;
-                    --preset) PRESET=$2 ;; --speed) SPEED=$2 ;;
+                    --preset) PRESET=$2 ;; --speed) SPEED=$2 ;; --discs) DISCS=$2 ;;
                 esac
                 shift 2 ;;
             --no-shutdown) SHUTDOWN=no; shift ;;
@@ -175,6 +192,7 @@ parse_args() {
     [[ -f $SOURCE ]] || die "Not a file: $SOURCE"
     SOURCE=$(realpath -- "$SOURCE")
     [[ $HOURS =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--hours wants a number, e.g. 8 or 6.5"
+    [[ -z $DISCS || $DISCS =~ ^[1-9][0-9]*$ ]] || die "--discs wants a number of discs, e.g. 3"
 }
 
 # Asks for the label now, while someone is at the keyboard.
@@ -221,13 +239,29 @@ main() {
     for bin in rsync udisksctl findmnt lsblk systemctl awk; do
         command -v "$bin" >/dev/null || die "Missing command: $bin"
     done
-    [[ -x $BD_ENCODE && -x $BD_BURN ]] ||
-        die "bd-encode.sh and bd-burn.sh must sit next to this script in $SCRIPT_DIR."
+    [[ -x $BD_ENCODE && -x $BD_BURN && -x $BD_SPLIT ]] ||
+        die "bd-encode.sh, bd-split.sh and bd-burn.sh must sit next to this script in $SCRIPT_DIR."
 
     local -a dev=()
     [[ -z $DEVICE ]] || dev=(--device "$DEVICE")
     # Checked before anything is moved, so a missing disc leaves the drive alone.
     "$BD_BURN" --free "${dev[@]}" >/dev/null || die "No writable disc in the drive."
+
+    # The original name, not NAME.bd.mkv, goes on the disc (or in the zip).
+    local stem=${SOURCE##*/}
+    stem=${stem%.*}
+    local name="$stem.mkv" temp_dir set_dir
+    temp_dir="$(videos_dir)/temp"
+    set_dir="$temp_dir/$stem.discs"
+
+    # A set split by an earlier run that did not get every disc burned.
+    if [[ -d $set_dir ]]; then
+        log "Found $set_dir from an earlier run; burning what is left of it, without encoding again."
+        VIDEO=$SOURCE
+        burn_set "$set_dir"
+        finish
+        return 0
+    fi
 
     grab_source "$SOURCE"
 
@@ -237,18 +271,36 @@ main() {
         'BEGIN { l = (s + h * 3600 - n) / 3600; printf "%.3f", (l > 0 ? l : 0) }')
     local -a encode_args=("${dev[@]}" --hours "$hours_left")
     [[ -z $PRESET ]] || encode_args+=(--preset "$PRESET")
-    local encoded rc=0
+    [[ -z $DISCS ]] || encode_args+=(--discs "$DISCS")
+    local encoded rc=0 discs
     encoded=$("$BD_ENCODE" "${encode_args[@]}" "$VIDEO") || rc=$?
     if (( rc == ALREADY_FITS )); then
-        log "${VIDEO##*/} already fits on the disc; nothing was encoded or burned."
-        notify "Blu-ray job: nothing to do" "${VIDEO##*/} already fits on the disc; it was not burned."
+        discs=$("$BD_SPLIT" "${dev[@]}" --discs-needed "$VIDEO") ||
+            die "Cannot work out how many discs ${VIDEO##*/} takes."
+        if (( discs == 1 )); then
+            log "${VIDEO##*/} already fits on the disc; nothing was encoded or burned."
+            notify "Blu-ray job: nothing to do" "${VIDEO##*/} already fits on the disc; it was not burned."
+            return 0
+        fi
+        log "${VIDEO##*/} already fits on $discs discs as it is; splitting it without encoding."
+        split_into_set "$VIDEO" "$temp_dir"
+        burn_set "$set_dir"
+        finish
         return 0
     fi
     (( rc == 0 )) && [[ -f $encoded ]] || die "Encoding failed (bd-encode.sh exited with $rc)."
 
-    # The disc gets the original name, not NAME.bd.mkv.
-    local name=${VIDEO##*/}
-    name="${name%.*}.mkv"
+    discs=$("$BD_SPLIT" "${dev[@]}" --discs-needed "$encoded") ||
+        die "Cannot work out how many discs $encoded takes."
+    if (( discs > 1 )); then
+        split_into_set "$encoded" "$temp_dir"
+        # The volumes hold all of it, tested; the encode is not needed again.
+        rm -f -- "$encoded"
+        burn_set "$set_dir"
+        finish
+        return 0
+    fi
+
     local -a burn_args=(--yes "${dev[@]}" --label "$LABEL" --name "$name")
     [[ -z $SPEED ]] || burn_args+=(--speed "$SPEED")
     "$BD_BURN" "${burn_args[@]}" "$encoded" ||
@@ -257,7 +309,41 @@ main() {
     rm -f -- "$encoded"
     notify "Blu-ray done" "$name was burned and verified."
     log "Done. Source kept at $VIDEO; the encode was deleted after the verified burn."
+    finish
+}
 
+# These helpers see main's locals (dev, name) through bash's dynamic scope.
+
+# Splits FILE into DIR/STEM.discs, named after the source.
+split_into_set() {
+    "$BD_SPLIT" "${dev[@]}" --name "$name" --output-dir "$2" "$1" >/dev/null ||
+        die "Splitting ${1##*/} into disc volumes failed."
+}
+
+# Burns every volume left in SET_DIR, one per disc, deleting each once its
+# disc is verified, so a rerun picks up where this one stopped.
+burn_set() {
+    local dir=$1 path
+    local -a volumes burn_args=(--yes "${dev[@]}" --label "$LABEL" --each)
+    [[ -z $SPEED ]] || burn_args+=(--speed "$SPEED")
+    shopt -s nullglob
+    volumes=("$dir"/*.zip.[0-9][0-9][0-9]*)
+    shopt -u nullglob
+    if [[ ${#volumes[@]} -eq 0 ]]; then
+        rmdir -- "$dir" 2>/dev/null || true
+        die "$dir holds no volumes; nothing to burn. Run again to start over."
+    fi
+    log "Burning ${#volumes[@]} disc(s): ${volumes[*]##*/}"
+    "$BD_BURN" "${burn_args[@]}" "${volumes[@]}" | while IFS= read -r path; do
+        rm -f -- "$path"
+        log "${path##*/} is on its disc, verified; deleted here."
+    done || die "Burning failed. The volumes not yet burned are kept in $dir; run again with a blank disc to carry on."
+    rmdir -- "$dir" || log "$dir is not empty; left as it is."
+    notify "Blu-ray done" "All ${#volumes[@]} disc(s) of $name were burned and verified."
+    log "Done. Source kept at $VIDEO; every volume was deleted after its verified burn."
+}
+
+finish() {
     if [[ $SHUTDOWN == yes ]]; then
         power_off
     fi

@@ -5,11 +5,13 @@
 # the disc label and path is the file's path relative to the disc root.
 # Linux (Fedora/GNOME) only.
 #
-#   1. The disc is mounted through UDisks if it is not already (and unmounted
-#      again afterwards, so the drive is left as it was found).
-#   2. The catalog gets a header the first time. Cataloguing a disc again
-#      replaces its rows instead of adding duplicates; other discs' rows are
-#      kept untouched, in order.
+#   1. The disc is mounted through UDisks if it is not already, and ejected
+#      once its rows are written, ready for the next one (--no-eject keeps
+#      it in, unmounted again if this script mounted it).
+#   2. The catalog gets a header the first time, and is only ever added to.
+#      A disc whose id is already in it is refused (exit 4, with a desktop
+#      notification): nothing is written and the disc stays in the drive, so
+#      a second disc with the same label never goes unnoticed.
 #   3. The new catalog is written beside the old one and renamed over it, so
 #      an interrupted run never leaves it half written.
 #
@@ -20,12 +22,23 @@ set -euo pipefail
 DEVICE=""
 LABEL=""
 OUTPUT="$HOME/Documents/bd-catalog.csv"
-EJECT=0
+EJECT=1
 MOUNTED_BY_US=0
 TMP=""
+DUPLICATE=4
 
 log() { printf '[bd-catalog %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
+
+# Stops on an id already catalogued: on the terminal and on the desktop, as
+# the run may be unattended.
+flag_duplicate() {
+    local msg="Disc id '$LABEL' is already in $OUTPUT. Nothing was written."
+    log "DUPLICATE: $msg Re-run with --label NEW_ID if it is another disc."
+    command -v notify-send >/dev/null &&
+        notify-send -u critical "bd-catalog: duplicate disc id" "$msg" 2>/dev/null
+    exit "$DUPLICATE"
+}
 
 usage() {
     cat <<HELP
@@ -33,13 +46,14 @@ Usage: ${0##*/} [options]
 
 Adds the files of the disc in the drive to a single CSV catalog, one row per
 file: the disc label (id), then the file's path relative to the disc.
-Running it again on the same disc replaces that disc's rows.
+A disc whose id is already in the catalog is refused (exit 4): nothing is
+written and the disc is not ejected. Use --label to give it another id.
 
 Options:
   --device DEV   optical drive (default: /dev/sr0, else the first /dev/sr*)
   --output FILE  catalog to write (default: ~/Documents/bd-catalog.csv)
   --label NAME   id to use instead of the disc's own label
-  --eject        eject the disc when done
+  --no-eject     leave the disc in the drive (default: eject when done)
   -h, --help     this help
 HELP
 }
@@ -71,7 +85,7 @@ parse_args() {
                     --device) DEVICE=$2 ;; --output) OUTPUT=$2 ;; --label) LABEL=$2 ;;
                 esac
                 shift ;;
-            --eject) EJECT=1 ;;
+            --no-eject) EJECT=0 ;;
             -h|--help) usage; exit 0 ;;
             *) usage >&2; die "Unknown argument: $1" ;;
         esac
@@ -108,16 +122,17 @@ read_label() {
 }
 
 write_catalog() {
-    local id dir count=0 kept=0 rel
+    local id dir count=0 rel
     id=$(csv_field "$LABEL")
     dir=$(dirname -- "$OUTPUT")
     mkdir -p -- "$dir"
     TMP=$(mktemp -- "$dir/.bd-catalog.XXXXXX")
 
-    # Header, then every other disc's rows as they were.
+    # Header, then every disc already catalogued, as it was.
     if [[ -s $OUTPUT ]]; then
-        awk -v p="$id," 'NR == 1 || index($0, p) != 1' "$OUTPUT" >"$TMP"
-        kept=$(($(wc -l <"$TMP") - 1))
+        awk -v p="$id," 'NR > 1 && index($0, p) == 1 { found = 1; exit }
+                         END { exit !found }' "$OUTPUT" && flag_duplicate
+        cp -- "$OUTPUT" "$TMP"
     else
         printf 'id,path\n' >"$TMP"
     fi
@@ -131,7 +146,7 @@ write_catalog() {
     chmod --reference="$OUTPUT" -- "$TMP" 2>/dev/null || chmod 644 -- "$TMP"
     mv -f -- "$TMP" "$OUTPUT"
     TMP=""
-    log "Catalogued $count files from '$LABEL' into $OUTPUT ($kept rows from other discs kept)."
+    log "Catalogued $count files from '$LABEL' into $OUTPUT."
 }
 
 main() {
@@ -148,7 +163,11 @@ main() {
     write_catalog
     if ((EJECT)); then
         udisksctl unmount --no-user-interaction -b "$DEVICE" >/dev/null 2>&1 || true
-        eject -- "$DEVICE" 2>/dev/null || log "Could not eject $DEVICE."
+        if eject -- "$DEVICE" 2>/dev/null; then
+            log "Ejected $DEVICE."
+        else
+            log "Could not eject $DEVICE; is a program still using the disc?"
+        fi
     fi
 }
 

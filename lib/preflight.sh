@@ -23,6 +23,12 @@ _pf_hint() {
         magick)
             if _pf_is_mac; then echo "brew install imagemagick"
             else echo "sudo dnf install ImageMagick"; fi ;;
+        mkvmerge|mkvpropedit)
+            if _pf_is_mac; then echo "brew install mkvtoolnix"
+            else echo "sudo dnf install mkvtoolnix"; fi ;;
+        jq)
+            if _pf_is_mac; then echo "brew install jq"
+            else echo "sudo dnf install jq"; fi ;;
         *)  echo "instale '$1'" ;;
     esac
 }

@@ -15,7 +15,9 @@
    subliminal providers (OpenSubtitles.com, Podnapisi, Gestdown, ...).
    Candidates are ranked by subliminal's score; a hash match means the
    subtitle was made for this exact file.
-3. Downloads the best candidate and runs ffsubsync on it against the audio.
+3. Downloads the best candidate and runs ffsubsync on it. The reference is
+   the timing of the movie's own image subtitles (Blu-ray PGS) when it has
+   any, since those match this exact cut and framerate; otherwise the audio.
    - offset below --tolerance and no framerate change: already in sync,
      saved untouched;
    - otherwise the corrected version is saved;
@@ -154,11 +156,77 @@ def ranked_candidates(pool: ProviderPool, video, lang: Language) -> list:
 
 # ----------------------------------------------------------------- 3. syncing
 
-def sync(movie: Path, srt_in: Path, srt_out: Path) -> dict:
-    """Run ffsubsync with the movie's audio as reference."""
+def pgs_cues(sup: bytes) -> list[tuple[float, float]]:
+    """(start, end) seconds of each picture in a PGS (.sup) stream.
+
+    Every Presentation Composition Segment replaces what is on screen: one
+    with objects starts a cue, one without clears it.
+    """
+    cues, start, i = [], None, 0
+    while i + 13 <= len(sup) and sup[i:i + 2] == b"PG":
+        pts = int.from_bytes(sup[i + 2:i + 6], "big") / 90000
+        kind = sup[i + 10]
+        size = int.from_bytes(sup[i + 11:i + 13], "big")
+        if kind == 0x16 and size >= 11:  # PCS; byte 10 = number of objects shown
+            if start is not None:
+                cues.append((start, pts))
+                start = None
+            if sup[i + 13 + 10] > 0:
+                start = pts
+        i += 13 + size
+    return [(a, b) for a, b in cues if b - a > 0.3]  # drop fade/refresh slivers
+
+
+def disc_reference(movie: Path, tmpdir: Path) -> Path | None:
+    """Timings of the movie's own image subtitles (Blu-ray PGS), as an SRT.
+
+    A disc subtitle was timed against this exact cut and framerate, so it is a
+    far better sync reference than the audio: speech detection on a loud 7.1
+    mix can lock onto music and effects, and with a subtitle made for a 25 fps
+    release it found a wrong offset and framerate. ffsubsync only reads the
+    timings, so the text is a placeholder. The track with the most cues wins
+    (a forced-only track has a handful). None if there is no usable PGS track.
+    """
+    pgs = [s for s in probe(movie)["subs"] if s.get("codec_name") == "hdmv_pgs_subtitle"]
+    if not pgs:
+        return None
+    cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", str(movie)]
+    for n, s in enumerate(pgs):
+        cmd += ["-map", f"0:{s['index']}", "-c", "copy", "-f", "sup", str(tmpdir / f"ref{n}.sup")]
+    if subprocess.run(cmd, capture_output=True).returncode != 0:
+        return None
+    best: list[tuple[float, float]] = []
+    for n in range(len(pgs)):
+        sup = tmpdir / f"ref{n}.sup"
+        cues = pgs_cues(sup.read_bytes()) if sup.exists() else []
+        sup.unlink(missing_ok=True)
+        if len(cues) > len(best):
+            best = cues
+    if len(best) < 100:  # forced/sign tracks only: too sparse to sync a full subtitle
+        return None
+    ref = pysubs2.SSAFile()
+    ref.events = [pysubs2.SSAEvent(start=int(a * 1000), end=int(b * 1000), text=".")
+                  for a, b in best]
+    out = tmpdir / "reference.srt"
+    ref.save(str(out), format_="srt")
+    eprint(f"  sync reference: the movie's own subtitle timings ({len(best)} cues)")
+    return out
+
+
+def sync(movie: Path, reference: Path | None, srt_in: Path, srt_out: Path) -> dict:
+    """Run ffsubsync against the disc subtitle timings, or else the audio.
+
+    Audio is pinned to the first audio stream: left alone, ffsubsync syncs
+    against the first text subtitle already in the movie (e.g. one this script
+    embedded earlier) and calls any subtitle aligned to it in sync.
+    """
     from ffsubsync.ffsubsync import make_parser, run
 
-    args = make_parser().parse_args([str(movie), "-i", str(srt_in), "-o", str(srt_out)])
+    if reference is not None:
+        argv = [str(reference)]
+    else:
+        argv = [str(movie), "--reference-stream", "a:0"]
+    args = make_parser().parse_args(argv + ["-i", str(srt_in), "-o", str(srt_out)])
     return run(args)
 
 
@@ -177,7 +245,7 @@ def max_shift(srt: Path, offset: float, scale: float) -> float:
 
 
 def process(movie: Path, video, pool: ProviderPool, lang: Language, opts,
-            embedded: set[str]) -> tuple[bool, Path | None]:
+            embedded: set[str], reference: Path | None) -> tuple[bool, Path | None]:
     """Find, download and sync one language.
 
     Returns (ok, path of a synced .srt ready to embed, or None).
@@ -233,8 +301,9 @@ def process(movie: Path, video, pool: ProviderPool, lang: Language, opts,
             if best_unsynced is None:
                 best_unsynced = sub.content
 
-            eprint("    checking sync against the audio...")
-            result = sync(movie, raw, fixed)
+            against = "the disc subtitle" if reference else "the audio"
+            eprint(f"    checking sync against {against}...")
+            result = sync(movie, reference, raw, fixed)
             if result.get("retval") or not result.get("sync_was_successful"):
                 eprint("    ffsubsync could not align it; trying the next one")
                 continue
@@ -459,11 +528,14 @@ def main() -> int:
                 embedded = check_movie(movie, languages)
                 video = identify(movie)
                 ready: list[tuple[Language, Path]] = []
-                for lang in languages:
-                    lang_ok, srt = process(movie, video, pool, lang, opts, embedded)
-                    ok &= lang_ok
-                    if srt:
-                        ready.append((lang, srt))
+                with tempfile.TemporaryDirectory(prefix="fetch-subtitle-ref-") as refdir:
+                    reference = disc_reference(movie, Path(refdir))
+                    for lang in languages:
+                        lang_ok, srt = process(movie, video, pool, lang, opts, embedded,
+                                               reference)
+                        ok &= lang_ok
+                        if srt:
+                            ready.append((lang, srt))
                 # All languages in one pass: rewriting a 50 GB remux once is enough.
                 if ready and opts.embed and embed(movie, ready):
                     for _, srt in ready:

@@ -12,10 +12,9 @@
 #      in every folder except hidden ones, the recycle bins and "System
 #      Volume Information". A .ts file counts only when it really is an MPEG
 #      transport stream, not TypeScript source.
-#   3. Each drive gets its own folder in ~/Videos, named after its volume
-#      label (else its model), and its folder layout is kept inside it:
-#      E:\Trips\2024\beach.mp4 on a stick labelled KINGSTON lands in
-#      ~/Videos/KINGSTON/Trips/2024/beach.mp4.
+#   3. Every video lands directly in ~/Videos under its own file name; no
+#      folders are made there, whatever folder it sat in on the drive:
+#      E:\Trips\2024\beach.mp4 lands in ~/Videos/beach.mp4.
 #   4. Nothing is overwritten. A file already there with the same size was
 #      copied before and is skipped, so running again copies only what is
 #      new; a different file with the same name gets " (2)" added. The free
@@ -45,8 +44,7 @@ MOUNT=1
 POWER_OFF=0
 FOLDERS=()
 
-SRC_DIRS=()     # where to look ...
-SRC_NAMES=()    # ... and the folder in DEST each one goes to
+SRC_DIRS=()     # where to look
 PLAN_SRC=()
 PLAN_DST=()
 PLAN_SIZE=()
@@ -65,9 +63,9 @@ usage() {
 Usage: copy-videos.sh [options] [FOLDER...]
 
 Copies every video on the removable drives (USB disks, flash drives, memory
-cards, optical discs) into ~/Videos, one folder per drive, keeping each
-drive's folder layout. Nothing is overwritten; what was copied before is
-skipped.
+cards, optical discs) straight into ~/Videos, without subfolders. Nothing
+is overwritten: a different video with a name already taken gets " (2)",
+and what was copied before is skipped.
 
   FOLDER        search these folders instead of the removable drives
   -d, --dest DIR   where to copy to (default: ~/Videos)
@@ -98,32 +96,11 @@ parse_args() {
     DEST=$(realpath -m -- "$DEST")
 }
 
-# A name that works as a folder name.
-safe_name() {
-    local s=${1//\//_}
-    s=${s#.}
-    printf '%s' "${s:-drive}"
-}
-
-# Adds SRC_DIRS/SRC_NAMES entries, making the names unique.
-add_source() {
-    local dir=$1 name base n=2 used n2
-    base=$(safe_name "$2"); name=$base
-    while :; do
-        used=0
-        for n2 in "${SRC_NAMES[@]}"; do [[ $n2 == "$name" ]] && used=1; done
-        ((used)) || break
-        name="$base ($n)"; n=$((n + 1))
-    done
-    SRC_DIRS+=("$dir"); SRC_NAMES+=("$name")
-}
-
 find_sources() {
-    local f disk dev fs mp name
+    local f disk dev fs mp
     if ((${#FOLDERS[@]})); then
         for f in "${FOLDERS[@]}"; do
-            f=$(realpath -- "$f")
-            add_source "$f" "$(basename -- "$f")"
+            SRC_DIRS+=("$(realpath -- "$f")")
         done
         return 0
     fi
@@ -135,10 +112,7 @@ find_sources() {
         while IFS=$'\t' read -r dev fs; do
             mp=$(rm_mountpoint "$dev")
             [[ -n $mp && -d $mp ]] || continue
-            name=$(rm_field "$dev" LABEL)
-            [[ -n $name ]] || name=$(rm_field "$disk" MODEL)
-            [[ -n $name ]] || name=${dev##*/}
-            add_source "$mp" "$name"
+            SRC_DIRS+=("$mp")
         done < <(rm_volumes "$disk")
     done < <(rm_disks)
     ((${#SRC_DIRS[@]})) || die "No mounted removable drives found. Plug one in (or check usb-mount.sh --list)."
@@ -156,9 +130,10 @@ is_mpeg_ts() {
 # free_name DST SIZE: DST, or DST with " (2)", " (3)"... before the
 # extension when that name is taken (or about to be, by an earlier file of
 # this run). Fails when one of those names already holds a file of SIZE
-# bytes: this video was copied on an earlier run.
+# bytes, or is about to: this video was copied on an earlier run, or is
+# also on another drive or in another folder and copied once already.
 free_name() {
-    local dst=$1 size=$2 stem ext n=2 cand p taken
+    local dst=$1 size=$2 stem ext n=2 cand j taken
     stem=${dst%.*}; ext=${dst##*.}
     cand=$dst
     while :; do
@@ -167,7 +142,11 @@ free_name() {
             [[ -f $cand && $(stat -c %s -- "$cand") == "$size" ]] && return 1
             [[ -e $cand ]] && taken=1
         fi
-        for p in "${PLAN_DST[@]}"; do [[ $p == "$cand" ]] && taken=1; done
+        for j in "${!PLAN_DST[@]}"; do
+            [[ ${PLAN_DST[j]} == "$cand" ]] || continue
+            [[ ${PLAN_SIZE[j]} == "$size" ]] && return 1
+            taken=1
+        done
         ((taken)) || break
         cand="$stem ($n).$ext"; n=$((n + 1))
     done
@@ -175,18 +154,17 @@ free_name() {
 }
 
 plan() {
-    local i dir name file rel dst size args=() e
+    local i dir file dst size args=() e
     for e in "${VIDEO_EXT[@]}"; do args+=(-o -iname "*.$e"); done
     args=("${args[@]:1}")
 
     for i in "${!SRC_DIRS[@]}"; do
-        dir=${SRC_DIRS[i]}; name=${SRC_NAMES[i]}
+        dir=${SRC_DIRS[i]}
         log "Looking for videos in $dir..."
         while IFS= read -r -d '' file; do
             [[ ${file,,} == *.ts ]] && ! is_mpeg_ts "$file" && continue
-            rel=${file#"$dir"/}
             size=$(stat -c %s -- "$file")
-            if ! dst=$(free_name "$DEST/$name/$rel" "$size"); then
+            if ! dst=$(free_name "$DEST/${file##*/}" "$size"); then
                 SKIPPED=$((SKIPPED + 1))
                 continue
             fi

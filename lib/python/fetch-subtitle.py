@@ -53,7 +53,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pysubs2
-from babelfish import Language
+from babelfish import Language, LanguageReverseError
 from subliminal import (
     ProviderPool,
     compute_score,
@@ -72,6 +72,9 @@ REFINERS = ["hash", "metadata", "tmdb"]
 CREDENTIALS_FILE = (Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
                     / "fetch-subtitle" / "opensubtitles.conf")
 MKV_EXTS = {".mkv"}
+# Track-name ending of the stand-in text subtitles dvd-to-mkv.sh reads with
+# OCR; a fetched subtitle in the same language replaces them.
+OCR_SUFFIX = "(OCR)"
 FFMPEG_EXTS = {".mp4", ".m4v", ".mov"}  # subtitles go in as mov_text
 # Room left over after writing a copy of the movie.
 SPACE_MARGIN = 512 * 1024 * 1024
@@ -119,17 +122,35 @@ def check_movie(movie: Path, languages: list[Language]) -> set[str]:
     eprint(f"  {len(info['audio'])} audio track(s), {mins} min")
 
     for s in info["subs"]:
-        tag = (s.get("tags") or {}).get("language", "und")
-        try:
-            lang = Language.fromcode(tag, "alpha3b") if tag != "und" else None
-        except ValueError:
-            lang = None
+        tags = s.get("tags") or {}
+        tag = tags.get("language", "und")
+        lang = from_alpha3b(tag)
         hit = lang is not None and any(lang.alpha3 == want.alpha3 for want in languages)
+        ocr = is_ocr_title(tags.get("title"))
+        if ocr:
+            mark = "  <- OCR, to be replaced" if hit else ""
+            eprint(f"  embedded subtitle: {tag} (OCR text){mark}")
+            continue  # a stand-in, not a subtitle worth keeping over a real one
         mark = "  <- same language" if hit else ""
         eprint(f"  embedded subtitle: {tag} ({s.get('codec_name')}){mark}")
         if lang is not None:
             embedded.add(lang.alpha3)
     return embedded
+
+
+def from_alpha3b(tag: str | None) -> Language | None:
+    """The Language of a Matroska/ffprobe language tag (ISO 639-2/B), or None."""
+    if not tag or tag == "und":
+        return None
+    try:
+        return Language.fromcode(tag, "alpha3b")
+    except (ValueError, LanguageReverseError):
+        return None
+
+
+def is_ocr_title(title: str | None) -> bool:
+    """True for a text track dvd-to-mkv.sh made with OCR ("English (OCR)")."""
+    return bool(title) and title.rstrip().endswith(OCR_SUFFIX)
 
 
 def output_path(movie: Path, lang: Language) -> Path:
@@ -340,20 +361,35 @@ def track_title(lang: Language) -> str:
     return f"{lang.name} ({country.name.title()})" if country else lang.name
 
 
-def mkvmerge_cmd(src: Path, out: Path, subs: list[tuple[Language, Path]]) -> list[str]:
+def mkvmerge_cmd(src: Path, out: Path, subs: list[tuple[Language, Path]]) -> tuple[list[str], int]:
+    """The mkvmerge command, and how many tracks it leaves out.
+
+    The OCR text tracks (dvd-to-mkv.sh) of the languages being added are
+    left out: the fetched subtitle replaces them.
+    """
     cmd = ["mkvmerge", "--quiet", "-o", str(out)]
-    # Only the new subtitle should be shown by default.
+    replacing = {lang.alpha3 for lang, _ in subs}
+    drop = []
     info = json.loads(subprocess.run(["mkvmerge", "-J", str(src)], check=True,
                                      capture_output=True, text=True).stdout)
     for track in info.get("tracks", []):
-        if track.get("type") == "subtitles":
+        if track.get("type") != "subtitles":
+            continue
+        props = track.get("properties") or {}
+        lang = from_alpha3b(props.get("language"))
+        if is_ocr_title(props.get("track_name")) and lang and lang.alpha3 in replacing:
+            drop.append(str(track["id"]))
+        else:
+            # Only the new subtitle should be shown by default.
             cmd += ["--default-track-flag", f"{track['id']}:no"]
+    if drop:
+        cmd += ["--subtitle-tracks", "!" + ",".join(drop)]
     cmd.append(str(src))
     for i, (lang, srt) in enumerate(subs):
         cmd += ["--language", f"0:{lang}", "--track-name", f"0:{track_title(lang)}",
                 "--default-track-flag", f"0:{'yes' if i == 0 else 'no'}",
                 "--sub-charset", "0:UTF-8", str(srt)]
-    return cmd
+    return cmd, len(drop)
 
 
 def ffmpeg_cmd(src: Path, out: Path, subs: list[tuple[Language, Path]],
@@ -397,8 +433,12 @@ def embed(movie: Path, subs: list[tuple[Language, Path]]) -> bool:
     names = ", ".join(str(lang) for lang, _ in subs)
     eprint(f"\n> embedding {names} into {target.name} ({size / 2**30:.1f} GiB, nothing re-encoded)...")
     try:
+        dropped = 0
         if ext in MKV_EXTS:
-            proc = subprocess.run(mkvmerge_cmd(target, tmp, subs), capture_output=True, text=True)
+            cmd, dropped = mkvmerge_cmd(target, tmp, subs)
+            if dropped:
+                eprint(f"  replacing {dropped} OCR subtitle track(s) of the same language")
+            proc = subprocess.run(cmd, capture_output=True, text=True)
             failed = proc.returncode >= 2  # 1 = warnings only
         else:
             proc = subprocess.run(ffmpeg_cmd(target, tmp, subs, len(before["subs"])),
@@ -410,9 +450,9 @@ def embed(movie: Path, subs: list[tuple[Language, Path]]) -> bool:
 
         after = probe(tmp)
         problems = []
-        if len(after["subs"]) != len(before["subs"]) + len(subs):
-            problems.append(f"{len(after['subs'])} subtitle tracks, expected "
-                            f"{len(before['subs']) + len(subs)}")
+        expected = len(before["subs"]) + len(subs) - dropped
+        if len(after["subs"]) != expected:
+            problems.append(f"{len(after['subs'])} subtitle tracks, expected {expected}")
         if abs(after["duration"] - before["duration"]) > 1:
             problems.append(f"duration {after['duration']:.1f}s, was {before['duration']:.1f}s")
         if len(after["audio"]) != len(before["audio"]):
